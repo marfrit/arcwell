@@ -1,0 +1,102 @@
+{
+  "batch": "M0",
+  "leg": "002",
+  "recorded_utc": "2026-09-13T21:30:00Z",
+  "experiment1": {
+    "cards": {
+      "Arc Pro B60": {
+        "bdf": "0000:0f:00.0",
+        "vram_bytes": 25769803776,
+        "cpu_accessible_vram_bytes": 25669140480,
+        "bar2_bytes": 34359738368,
+        "rebar_max_bytes": 34359738368,
+        "rebar_sizes_offered_mib": [
+          256,
+          512,
+          1024,
+          2048,
+          4096,
+          8192,
+          16384,
+          32768
+        ],
+        "payload_link": "16 GT/s x8 at the on-board switch upstream port (PCIe 4.0 x8)",
+        "opencl_global_mem_bytes": 24385683456
+      },
+      "Arc A770": {
+        "bdf": "0000:06:00.0",
+        "vram_bytes": 17179869184,
+        "cpu_accessible_vram_bytes": 17079205888,
+        "bar2_bytes": 17179869184,
+        "rebar_max_bytes": 17179869184,
+        "rebar_sizes_offered_mib": [
+          256,
+          512,
+          1024,
+          2048,
+          4096,
+          8192,
+          16384
+        ],
+        "payload_link": "8 GT/s x4 at the on-board switch upstream port (PCIe 3.0 x4), behind the chipset",
+        "opencl_global_mem_bytes": 16225243136
+      }
+    },
+    "nvme": {
+      "bdf": "0000:01:00.0",
+      "model_class": "Samsung SM961 256 GB",
+      "link": "8 GT/s x4 on a CPU root port",
+      "partitions": "all ZFS members (SLOG, L2ARC, pool flash)",
+      "fiemap_capable_filesystem_present": false
+    },
+    "kernel_path": {
+      "kernel": "7.0.14 (distribution-patched), xe DKMS 7.0.14+p1",
+      "CONFIG_PCI_P2PDMA": true,
+      "CONFIG_DMABUF_MOVE_NOTIFY": true,
+      "iommu": "AMD-Vi, groups DMA-FQ",
+      "xe_dma_buf_exports_vram_to_peer2peer_importers": true,
+      "p2pmem_provider_registered": false,
+      "io_uring_dmabuf_for_block_io": false,
+      "note": "exporter half of rung 3 exists, importer half does not; rung 3 = kernel-module experiment"
+    },
+    "inbound_dma_probe": {
+      "status": "not_run",
+      "outcome": null,
+      "rung3_physically_possible": null,
+      "tool": "tools/m0/bar_inbound_dma_probe.py",
+      "why_not_run": "needs root on the host (PCI resource mmap + raw block device); the session tool-permission policy refused the action three times; not worked around",
+      "raw_log": ""
+    },
+    "v1_rung": 2
+  },
+  "experiment2": {
+    "method": "tools/m0/consumption_probe.py, 256 MiB u8 payload, Convert u8->i32 + ReduceSum over 4096-byte rows, exact against numpy, one-byte mutation moves exactly one partial, device->host read-back byte-exact; one fresh process per card",
+    "configuration": "OpenVINO 2026.4.0, NEO 26.27.39122.11, both cards idle, HDD-pool scrub ~0.5 GB/s on the chipset uplink the A770 shares; best of three",
+    "cards": {
+      "Arc Pro B60": {
+        "device": "GPU.0",
+        "consumption_verified": true,
+        "h2d_pageable_gbs": 13.56,
+        "h2d_pinned_gbs": 14.33,
+        "kernel_over_usm_host_gbs": 10.45,
+        "infer_256mib_ms": 6.3,
+        "mutation_rows_moved": [
+          32768
+        ],
+        "raw_log": "openvino 2026.4.0-22849-71640275d29 device GPU.0 Intel(R) Arc(TM) Pro B60 Graphics (dGPU)\ndevice total mem 24385683456\ncompile 2.874 s\npayload 268435456 bytes (256 MiB) sha256=622d8d451a66784c\ndevice tensor params {'MEM_HANDLE': '<OVAny class>', 'OCL_CONTEXT': '<OVAny class>', 'SHARED_MEM_TYPE': '<OVAny class>'}\nwarm-up infer on device tensor 91.3 ms, exact=True\npageable host -> device copy_from          copy    19.80 ms ( 13.56 GB/s)  copy+infer    26.28 ms  infer    6.42 ms  exact=True\nUSM host (pinned) fill from pageable       copy    22.75 ms ( 11.80 GB/s)  copy+infer    29.22 ms  infer    6.41 ms  exact=True\nUSM host (pinned) -> device copy_from      copy    18.73 ms ( 14.33 GB/s)  copy+infer    25.03 ms  infer    6.29 ms  exact=True\nkernel reads USM host directly (no copy)                                   infer   25.69 ms ( 10.45 GB/s effective)  exact=True\nmutation: flipped byte at row 32768 col 7; rows whose partial moved: [32768]; matches mutated expectation: True\ndevice -> host copy_to byte-exact with mutated payload: True\nPCIe link states seen on 0000:0f:00.0 during the run: ['2.5 GT/s PCIe x1']\nRESULT consumption_verified=True GPU.0\n"
+      },
+      "Arc A770": {
+        "device": "GPU.1",
+        "consumption_verified": true,
+        "h2d_pageable_gbs": 1.78,
+        "h2d_pinned_gbs": 1.83,
+        "kernel_over_usm_host_gbs": 1.76,
+        "infer_256mib_ms": 9.4,
+        "mutation_rows_moved": [
+          32768
+        ],
+        "raw_log": "openvino 2026.4.0-22849-71640275d29 device GPU.1 Intel(R) Arc(TM) A770 Graphics (dGPU)\ndevice total mem 16225243136\ncompile 0.279 s\npayload 268435456 bytes (256 MiB) sha256=622d8d451a66784c\ndevice tensor params {'MEM_HANDLE': '<OVAny class>', 'OCL_CONTEXT': '<OVAny class>', 'SHARED_MEM_TYPE': '<OVAny class>'}\nwarm-up infer on device tensor 10.0 ms, exact=True\npageable host -> device copy_from          copy   150.95 ms (  1.78 GB/s)  copy+infer   160.53 ms  infer    9.53 ms  exact=True\nUSM host (pinned) fill from pageable       copy   183.63 ms (  1.46 GB/s)  copy+infer   193.13 ms  infer    9.44 ms  exact=True\nUSM host (pinned) -> device copy_from      copy   146.61 ms (  1.83 GB/s)  copy+infer   156.02 ms  infer    9.36 ms  exact=True\nkernel reads USM host directly (no copy)                                   infer  152.71 ms (  1.76 GB/s effective)  exact=True\nmutation: flipped byte at row 32768 col 7; rows whose partial moved: [32768]; matches mutated expectation: True\ndevice -> host copy_to byte-exact with mutated payload: True\nPCIe link states seen on 0000:06:00.0 during the run: ['2.5 GT/s PCIe x1']\nRESULT consumption_verified=True GPU.1\n"
+      }
+    }
+  }
+}
