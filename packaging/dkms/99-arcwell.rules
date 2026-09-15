@@ -1,0 +1,5 @@
+# /dev/arcwell registers VRAM buffers as NVMe DMA targets. That is a privileged
+# operation: a caller supplies raw block numbers, so read access to the device is
+# read access to the whole namespace. Restrict it to the group that already owns
+# GPU access rather than widening it.
+KERNEL=="arcwell", SUBSYSTEM=="misc", MODE="0660", GROUP="render"

@@ -1,0 +1,94 @@
+==== BACKLOG item 20 — DISPROVED ====
+date: 2026-09-15
+cell: stub/test/aw_wc_test.c
+host: Proxmox host, kernel 7.0.14-12-pve, both Arc cards present
+
+CLAIM UNDER TEST (results/E2E_2026-09-15.txt, filed as HYPOTHESIS with a
+TO CONFIRM): "a 128 MiB p2pdma carve destroys write-combining for BOs allocated
+inside it". It was inferred from a CPU-side verification loop that went from
+seconds to twelve minutes at 98.5% user CPU after the carve granule grew.
+
+VERDICT: NOT REPRODUCED. The carve does not change the CPU read rate at all.
+Two independent routes agree:
+
+  1. WITHIN ONE MAPPING. The same BO, the same pointer, the same loop, timed
+     before and after AW_IOC_MAP_BUFFER carves the range it lives in:
+     2.88 MB/s -> 2.88 MB/s. Slowdown factor 1.00x against a 10x threshold.
+
+  2. ACROSS CARDS. The A770 at 06:00.0 has no p2pmem attribute at all — arcwell
+     has never carved it — and it reads SLOWER (1.59 MB/s) than the B60 whose
+     BAR carries a 288 MiB carve (2.88 MB/s). If carving degraded the mapping
+     the ordering would be the other way round.
+
+WHAT THE TWELVE MINUTES ACTUALLY WAS. A CPU read of VRAM through a WC mmap costs
+~1.4 us per access on this fabric whether or not the range is carved. 2.88 MB/s
+over 4-byte reads is 1.36 us each. The loop that hung reads 1 MiB BYTE-WISE, so
+it issues ~1.05 million uncached PCIe reads per iteration, and it was run 20
+times. That is ~25 minutes per iteration of poison-check alone, arrived at with
+no reference to the carve. What grew between the fast run and the slow run was
+the iteration count, not the carve granule.
+
+The cell also reports memcpy on the same mapping: 15.4 MB/s, 5x the 4-byte loop,
+because memcpy issues wide loads. The original observation compared a memcpy-
+shaped read against a byte-wise one without saying so, which is where the
+apparent regression came from.
+
+CONSEQUENCE FOR THE PRODUCT: none. No data path reads VRAM with the CPU. The
+constraint this settles is a testing constraint, now stated plainly: do not
+verify VRAM contents by reading them with the CPU. aw_e2e_test already computes
+its poison sum arithmetically and lets the OpenCL kernel do the reading; that
+workaround stands, but it is a workaround for PCIe physics, not for a carve bug.
+
+RED-FIRST: --mutate divides the measured "after" rate by 1000, fabricating
+exactly the slowdown the hypothesis predicts. The verdict flips to CONFIRMED and
+the exit code to 2. The green is therefore computed from the measurement.
+
+######## RAW ########
+$ uname -r; date -u
+7.0.14-12-pve
+Tue Sep 15 07:24:58 PM UTC 2026
+
+$ for b in 0000:06:00.0 0000:0f:00.0; do ... p2pmem/size; done
+0000:06:00.0 p2pmem/size: (absent - never carved)
+0000:0f:00.0 p2pmem/size: 301989888
+
+$ ./aw_wc_test --drm /dev/dri/renderD129 --mutate      # RED leg
+==== arcwell item-20 WC cell [MUTATED - verdict must flip to CLEAN on a real slowdown] ====
+drm=/dev/dri/renderD129 bo=1048576 probe=65536 reps=3
+t_before:     2.88 MB/s  4-byte loop   |     15.39 MB/s  memcpy
+AW_IOC_MAP_BUFFER ok handle=32 out_flags=0x1
+t_after:      0.00 MB/s  4-byte loop   |     15.38 MB/s  memcpy   <-- MUTATED: 'after' divided by 1000
+          (same pointer, same loop, BO now inside a p2pdma carve)
+
+sums: 0x169696968000 / 0x169696968000  (read, not elided)
+slowdown factor: 1000.43x  (threshold 10x)
+memcpy vs 4-byte loop on the SAME mapping: 5x
+
+VERDICT: item 20 is CONFIRMED — the carve degrades the CPU mapping
+exit=2
+
+$ ./aw_wc_test --drm /dev/dri/renderD129               # GREEN leg, carved B60
+==== arcwell item-20 WC cell [normal] ====
+drm=/dev/dri/renderD129 bo=1048576 probe=65536 reps=3
+t_before:     2.88 MB/s  4-byte loop   |     15.36 MB/s  memcpy
+AW_IOC_MAP_BUFFER ok handle=33 out_flags=0x1
+t_after:      2.88 MB/s  4-byte loop   |     15.34 MB/s  memcpy
+          (same pointer, same loop, BO now inside a p2pdma carve)
+
+sums: 0x169696968000 / 0x169696968000  (read, not elided)
+slowdown factor: 1.00x  (threshold 10x)
+memcpy vs 4-byte loop on the SAME mapping: 5x
+
+VERDICT: item 20 is NOT REPRODUCED — the carve does not change the CPU read rate
+exit=0
+
+$ ./aw_wc_test --drm /dev/dri/renderD128               # CONTROL, uncarved A770
+FAIL: AW_IOC_MAP_BUFFER: Numerical result out of range
+==== arcwell item-20 WC cell [normal] ====
+drm=/dev/dri/renderD128 bo=1048576 probe=65536 reps=3
+t_before:     1.59 MB/s  4-byte loop   |      8.58 MB/s  memcpy
+
+######## REDACTION ########
+Host, container and path names were replaced with role words before
+publication (CLAUDE.md: this repository is public). Measurements,
+timings and kernel output are unaltered.

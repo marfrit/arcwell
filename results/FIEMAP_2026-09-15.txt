@@ -1,0 +1,35 @@
+Expert file -> absolute NVMe LBA translation, verified
+Campaign: docs/campaigns/miss-tier-direct.md
+Tool/cell: stub/tools/aw_fiemap.c   Store: /flash (nvme0n1p3, ext4, noatime)
+Date: 2026-09-15
+
+Per M4_API.md the module takes RAW BLOCK RANGES and FIEMAP is a once-at-open
+userspace translation. This is that translation plus the cell that proves it.
+
+######## RED: partition offset dropped -- MUST FAIL ########
+  /flash/experts/expert_0000.bin ext0 logical=0 phys=40103936 -> lba=78328 len=2457600  MISMATCH
+  RESULT=FAIL -- raw device at the computed LBA is not the file's bytes
+
+######## GREEN ########
+  ext0 logical=0 phys=40103936 -> ABSOLUTE LBA 100743672 len=2457600  match
+  8 files, 8 extents total (1.00 per file), 8 verified against the raw device
+  RESULT=PASS -- FIEMAP + partition offset gives the correct absolute LBA
+
+######## WHAT THE RED CASE DEMONSTRATES ########
+`fe_physical` is filesystem-relative. Without `+ 100665344` the computed LBA is
+78328 -- 48 GiB early, inside rpool's SLOG and L2ARC partitions. That read
+SUCCEEDS and returns plausible bytes; only the comparison catches it. An expert
+streamer with this bug serves garbage weights at full speed and reports no error.
+Absolute LBA = fe_physical/512 + 100665344.
+
+######## ONE EXTENT PER EXPERT ########
+1.00 extent per file: `posix_fallocate` then write gives each expert a single
+contiguous extent on ext4. That is M4_API.md option (B) behaving as specified --
+one contiguous DMA per expert, no extent-splitting, no gather list. It also means
+`out_segments` should read 1 per expert once it reports real DMA segments rather
+than page count.
+
+######## EXTENT HYGIENE ########
+The cell rejects UNWRITTEN, DELALLOC, INLINE, ENCODED and UNKNOWN extents, and
+passes FIEMAP_FLAG_SYNC so the file is flushed before mapping. A fallocate'd but
+unwritten extent would otherwise map to blocks that do not hold the bytes yet.

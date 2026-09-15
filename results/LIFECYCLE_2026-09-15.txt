@@ -1,0 +1,42 @@
+arcwell — buffer lifecycle (API work, not validation)
+Cell: stub/test/aw_lifecycle_test.c against stub/src/arcwell.c
+GPU:  Intel Arc A770 @ 0000:06:00.0 (renderD128)
+Date: 2026-09-15
+
+PROBLEM: AW_IOC_MAP_BUFFER registered a buffer forever. M4_API.md specified
+map + read + stats and no release call. There was no unmap ioctl, no .release
+handler, and no per-client ownership, so every registration leaked a pinned VRAM
+buffer and a dma-buf reference. Expert streaming registers continuously, so this
+made the surface unusable for its own stated purpose. It also meant a stuck
+client held the module: `rmmod` failed with "Module arcwell is in use" because an
+interrupted test still had /dev/arcwell open.
+
+IMPLEMENTED:
+  - AW_IOC_UNMAP_BUFFER (_IOW(AW_IOC_MAGIC, 4, __u32)), documented in aw_uapi.h
+    as an addition to the original contract, with the reason.
+  - Per-open client context; buffers belong to the file that registered them.
+  - .open / .release file operations; closing the fd reclaims everything, so a
+    crashing client cannot strand VRAM.
+  - kref on each buffer, so AW_IOC_UNMAP_BUFFER cannot free a buffer out from
+    under an in-flight AW_IOC_READ_BLOCKS.
+  - aw_ioc_stats gains buffers_live and buffers_peak. If peak only ever climbs,
+    the client is leaking registrations.
+
+######## RESULT ########
+==== arcwell buffer lifecycle ====
+registered 8 buffers, live=8
+unmapped 4, live=4
+stale and unknown handles correctly rejected
+closing fd with 4 buffer(s) still registered (kernel should report reclaiming them)
+RESULT=PASS -- unmap drops registrations, bad handles rejected, close reclaims
+exit=0
+
+kernel:
+  arcwell: MAP_BUFFER handle=8 npages=256 bytes=1048576 peer2peer=1 (live=8 peak=8)
+  arcwell: UNMAP_BUFFER handle=1 (live=7 peak=8)
+  arcwell: UNMAP_BUFFER handle=4 (live=4 peak=8)
+  arcwell: releasing 4 buffer(s) still registered at close
+
+The cell is able to fail: it asserts live==N after registering, live==N/2 after
+unmapping half, and that both a double unmap and an unknown handle are REJECTED.
+Any of those silently succeeding turns it red.

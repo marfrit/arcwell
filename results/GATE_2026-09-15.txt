@@ -1,0 +1,72 @@
+miss-tier-direct — THE GATE, measured
+Campaign: docs/campaigns/miss-tier-direct.md
+Card:     Arc Pro B60, 0000:0f:00.0, Gen4 x8 (renderD129 / OpenVINO GPU.0)
+Store:    /flash = nvme0n1p3, ext4, noatime; 1700 experts x 2,457,600 B, fallocate'd
+Transfer: 64 experts x 2,457,600 B = 150 MiB per batch, 16 batches = 2.34 GiB per run
+Kernel:   7.0.14-12-pve, rebooted clean before this window (tainted=12353, no D bit,
+          0 BUG/Oops lines this boot)
+Binary:   stub/test/aw_bp.c ; module stub/src/arcwell.c with bio-splitting
+SOP:      own sampler per leg, hard timeout -s KILL, zombie sweep by pid,
+          zero CONTENTION lines on all three legs (SLOG/L2ARC idle throughout)
+Date:     2026-09-15
+
+######## RESULTS ########
+
+| number          | B_P (GB/s) | C_proc (CPU-s/GiB) | C_sys (CPU-s/GiB) |
+|-----------------|-----------:|-------------------:|------------------:|
+| B_FABRIC        |      13.99 |                  - |                 - |
+| B_P_arcwell     |   **2.91** |         **0.0121** |        **0.0341** |
+| B_P_host_cold   |   **1.58** |             0.1971 |            0.1963 |
+| B_P_host_warm   |       8.51 |             0.1263 |            0.1280 |
+
+arcwell: via_host_bounce=0, max_inflight=193, extents 1024/1024 = 1.00 per expert.
+
+######## VERDICT AGAINST THE GATE'S OWN KILL CONDITIONS ########
+The campaign named three ways to fail. None fired.
+
+1. "B_P_arcwell < B_P_host_cold -> the bandwidth premise is dead."
+   2.91 > 1.58. **arcwell is 1.84x the cold host path.** Not dead.
+2. "B_P_host_cold already close to B_FABRIC -> no headroom."
+   1.58 of 13.99 = 11%. Enormous headroom. Not dead.
+3. "C_arcwell >= C_host -> the CPU component is dead."
+   0.0121 vs 0.1971 = **16.3x less process CPU per GiB**; system-wide 0.0341 vs
+   0.1963 = 5.8x less. Not dead.
+
+######## THE COLD/WARM DISTINCTION DECIDED THE OUTCOME ########
+Against B_P_host_warm (8.51 GB/s) arcwell loses 2.91 to 8.51 and the gate would
+have closed as a verdict killing the premise. That comparison prices a DRAM hit
+against a miss and is wrong; the miss tier is by definition the path taken when
+the bytes are NOT in DRAM, and there both paths start at the same drive. The warm
+number is retained because it bounds what residency buys (5.4x over cold), not as
+a comparand.
+
+######## WHAT THE NUMBERS SAY BEYOND PASS/FAIL ########
+- arcwell at 2.91 GB/s EXCEEDS the record's ~2.3 GB/s raw NVMe figure
+  (design-qwen-flash-next.md:1022). Either the drive is faster than that figure or
+  the P2P path avoids overhead the earlier measurement carried. Worth one cell to
+  separate; not asserted here.
+- arcwell uses 21% of B_FABRIC (2.91 of 13.99). Drive-bound, not fabric-bound, as
+  the fabric measurement predicted. A second drive is the lever on this axis, and
+  that is a hardware decision.
+- The CPU gap is the larger of the two effects and is the one that compounds:
+  FreeToken routes work to the CPU when B_P is low (q* ~= m*B_P/B_H), and M14
+  measured the host expert tier winning 15.0/15.5 vs 10.4/10.6 t/s when the CPU
+  is free. arcwell returns ~0.185 CPU-s per GiB of miss traffic to that tier.
+
+######## LIMITATIONS — none of these are hidden ########
+1. **B_P_host is NOT arcint's staging ring.** The campaign specified
+   design-qwen-flash-next.md:1315's method; this is the same SHAPE (pread into a
+   pinned CL_MEM_ALLOC_HOST_PTR buffer, then clEnqueueWriteBuffer, batched) but it
+   is my code, not arcint's patches/0006 path. A measurement against arcint's own
+   ring may differ and is still owed.
+2. **Synthetic experts.** 1700 fallocate'd files, single extent each, not the real
+   UD-Q3_K_XL GGUF. Real experts live at offsets inside multi-GB shards
+   (M4_API.md option A) and can span extent boundaries -> multi-segment DMA. This
+   store is option B, the recommended layout, so it measures the good case.
+3. **One card.** B60 only. The A770 is ineligible on bandwidth (B_FABRIC 1.84 GB/s,
+   below the drive) but the CPU component should still be taken there, since that
+   is the card where it dominates.
+4. **2.34 GiB per run**, ~0.9-1.6 s wall. Short enough that the sampler recorded
+   one sample, not a series. No memory pressure at any point.
+5. Page cache was dropped before each cold leg; arcwell reads the raw device and
+   never populates it, so its number is cold by construction.

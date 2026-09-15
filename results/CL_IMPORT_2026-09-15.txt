@@ -1,0 +1,50 @@
+arcwell — OpenCL consumption path (BACKLOG item 15, part 1 of 2)
+Cell: stub/test/aw_cl_import_test.c
+Where: a container on the target host, NEO driver 26.27.39122.11
+GPU: Intel Arc A770 via /dev/dri/renderD128 (-> 0000:06:00.0)
+Date: 2026-09-15
+
+arcwell is NOT involved in this cell. It isolates the consumption half: can an
+OpenCL kernel read an xe VRAM BO imported as a dma-buf?
+
+######## capability query ########
+platform 0: Intel(R) Arc(TM) Pro B60 Graphics
+  import handle types: 0x2067 (CL_EXTERNAL_MEMORY_HANDLE_DMA_BUF_KHR)
+platform 1: Intel(R) Arc(TM) A770 Graphics
+  import handle types: 0x2067 (CL_EXTERNAL_MEMORY_HANDLE_DMA_BUF_KHR)
+
+NOTE: clinfo's extension string lists only cl_khr_external_memory, NOT
+cl_khr_external_memory_dma_buf. The runtime nevertheless advertises the DMA_BUF
+import handle type and the import works. Do not conclude from the extension
+string alone that it is unsupported.
+
+######## RED: --mutate MUST FAIL ########
+BO filled, CPU reference sum = 0xcd820000
+MUTATED one word after taking the reference sum
+dma-buf fd = 4
+device: Intel(R) Arc(TM) A770 Graphics
+dma-buf imported into OpenCL
+acquire/release entry points: present
+fenced on cl_event from the kernel launch
+cpu_sum=0xcd820000 gpu_sum=0x07ef5e9d
+RESULT=FAIL -- GPU read does not match buffer contents
+exit=1
+
+######## GREEN: MUST PASS ########
+BO filled, CPU reference sum = 0xcd820000
+dma-buf fd = 4
+device: Intel(R) Arc(TM) A770 Graphics
+dma-buf imported into OpenCL
+acquire/release entry points: present
+fenced on cl_event from the kernel launch
+cpu_sum=0xcd820000 gpu_sum=0xcd820000
+RESULT=PASS -- an OpenCL kernel on Intel(R) Arc(TM) A770 Graphics read the xe VRAM BO through a dma-buf import
+exit=0
+
+Completion is fenced on a cl_event from the kernel launch, per ENGINEER_PROMPT.md
+§2 ("fence the copy completion against an OpenCL/OpenVINO event, not Level Zero").
+
+######## REDACTION ########
+Host, container and path names were replaced with role words before
+publication (CLAUDE.md: this repository is public). Measurements,
+timings and kernel output are unaltered.

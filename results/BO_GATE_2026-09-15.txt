@@ -1,0 +1,45 @@
+arcwell BO acceptance — raw output (BACKLOG item 14)
+Cell: stub/test/aw_bo_test.c against stub/src/arcwell.c
+Host: AMD B550M Pro4, Proxmox 7.0.14-12-pve, AMD-Vi translating IOMMU
+GPU:  Intel Arc A770 @ 0000:06:00.0 (renderD128), BAR2 0x7800000000 +0x400000000
+NVMe: Samsung SM961/PM961 @ 0000:01:00.0, /dev/nvme0n1, opened READ-ONLY
+Date: 2026-09-15
+
+######## module load ########
+[15078.702333] arcwell: ready. arc=0000:06:00.0 BAR2=0x0000007800000000+0x0000000400000000 nvme=0000:01:00.0 bdev=/dev/nvme0n1
+crw------- 1 root root 10, 262 /dev/arcwell
+
+######## RED: --mutate MUST FAIL ########
+==== arcwell BO acceptance [MUTATED - MUST FAIL] ====
+BO created handle=1
+BO poisoned with 0xa5 through its own xe mapping
+dma-buf fd=4
+AW_IOC_MAP_BUFFER ok handle=1 out_flags=0x1 (REQUIRE_P2P honoured)
+AW_IOC_READ_BLOCKS ok bytes=1048576 segments=256
+control read from 0x1000100000  <-- MUTATED COMPARAND
+stats: reads=1 bytes=1048576 us=7054 segments=256 via_host_bounce=0
+RESULT=FAIL -- BO content does not match disk
+exit=1
+[15078.754665] arcwell: sg[0] iova=0x00000000a6e00000 -> phys=0x0000007bf8900000 len=1048576
+[15078.762914] arcwell: carved BAR2 [0x0000007bf8800000 +200000) as P2P memory
+[15078.762918] arcwell: MAP_BUFFER handle=1 npages=256 bytes=1048576 peer2peer=1
+
+######## GREEN: MUST PASS ########
+==== arcwell BO acceptance [normal - must PASS] ====
+BO created handle=1
+BO poisoned with 0xa5 through its own xe mapping
+dma-buf fd=4
+AW_IOC_MAP_BUFFER ok handle=2 out_flags=0x1 (REQUIRE_P2P honoured)
+AW_IOC_READ_BLOCKS ok bytes=1048576 segments=256
+control read from 0x1000000000
+stats: reads=2 bytes=2097152 us=14136 segments=512 via_host_bounce=0
+RESULT=PASS -- disk bytes landed in a GPU-owned BO, verified through its xe mapping
+exit=0
+[15084.687564] arcwell: sg[0] iova=0x00000000a6c00000 -> phys=0x0000007bf9900000 len=1048576
+[15084.699451] arcwell: carved BAR2 [0x0000007bf9800000 +200000) as P2P memory
+[15084.699455] arcwell: MAP_BUFFER handle=2 npages=256 bytes=1048576 peer2peer=1
+
+NOTE ON THE us= FIGURE: 7054 us for 1 MiB is a raw observation from an
+unoptimised single-shot path, NOT a performance claim. No comparison with the
+309 us/tensor incumbent is made or implied; that requires the benchmark cell
+named in ENGINEER_PROMPT.md §6, which does not exist yet.

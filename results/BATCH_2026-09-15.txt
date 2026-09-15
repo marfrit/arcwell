@@ -1,0 +1,40 @@
+arcwell — AW_IOC_READ_BATCH (API work)
+Cell: stub/test/aw_batch_test.c against stub/src/arcwell.c
+GPU:  Intel Arc Pro B60 @ 0000:0f:00.0 (renderD129)
+Date: 2026-09-15
+
+WHY: M4_API.md states "A batch of experts is the inference pattern, not a single
+bulk read." AW_IOC_READ_BLOCKS calls submit_bio_wait() per transfer, so N experts
+serialise into N round-trips and the NVMe queue never holds more than one request.
+AW_IOC_READ_BATCH submits every bio first and waits afterwards.
+
+######## RESULT ########
+==== arcwell AW_IOC_READ_BATCH ====
+registered 16 expert buffers of 1048576 bytes
+batch: completed=16 bytes=16777216 err=0
+stats: batches=1 batch_reads=16 max_inflight=16 via_host_bounce=0
+bad-handle batch: err=-22 err_index=1 completed=0
+RESULT=PASS -- batch completes, submits concurrently (max_inflight=16), and reports bad requests
+exit=0
+
+kernel:
+  arcwell: READ_BATCH n=16 submitted=16 bytes=16777216 err=0
+  arcwell: READ_BATCH n=3 submitted=1 bytes=0 err=-22
+
+The load-bearing assertion is max_inflight == 16. If submission were still serial,
+or if the implementation quietly waited per request, it would read 1 and the cell
+goes red. The bad-handle case asserts the batch FAILS and names the offending
+index rather than silently doing less work than asked.
+
+######## AN ABI BREAK I INTRODUCED AND THEN FIXED ########
+Adding buffers_live/buffers_peak and the batch counters, I inserted them into the
+MIDDLE of struct aw_ioc_stats. AW_IOC_STATS is _IOR(..., struct aw_ioc_stats), so
+the struct size is encoded in the ioctl number: clients built against the older
+header computed a different command and got -ENOTTY, which surfaced as the
+lifecycle cell reporting "fresh fd does not start at 0 live". It failed loudly
+rather than silently misreading fields, which is a property of the original
+author's choice of _IOR, not of my change.
+
+Fixed: the original five fields are back in their original order with a
+DO-NOT-REORDER note, and everything new is appended at the end. All clients are
+now built from one copy of the header.

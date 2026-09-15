@@ -1,0 +1,44 @@
+The host-bounce detector — proving it is not decoration
+Cell: stub/test/aw_bounce_test.c   Card: Arc Pro B60   Date: 2026-09-15
+
+######## WHY THIS CELL EXISTS ########
+Five cells asserted via_host_bounce == 0. The field had NO increment site
+anywhere in the module: g_stats is static, so it was zero by construction and
+every one of those assertions was unfalsifiable -- decoration under
+HOUSE_RULES.md §5. A reviewer found it; I did not.
+
+######## FIX ########
+Two increment sites in stub/src/arcwell.c, both on paths that DETECT and REFUSE:
+  - the exporter cleared attach->peer2peer (a mapping there would bounce);
+  - an sg page is not a P2PDMA page (the sg is system memory).
+Neither performs a bounce. There is no path that bounces at all; the counter
+records refused attempts, and 0 means none were even attempted.
+
+Plus debug_force_bounce=1, fault injection so the detector can be exercised.
+
+######## RESULT ########
+ARM 1, normal:
+  MAP_BUFFER rc=0 ; via_host_bounce 0 -> 0 (delta 0)
+  RESULT=PASS -- mapped peer-to-peer, counter unmoved
+ARM 2, debug_force_bounce=1:
+  MAP_BUFFER rc=-1 errno=Operation not supported ; via_host_bounce 0 -> 1 (delta 1)
+  RESULT=PASS -- detected, counted (+1) and refused
+  kernel: arcwell: exporter refused peer2peer; a mapping here would be a HOST
+          BOUNCE. Failing per AW_MAP_F_REQUIRE_P2P.
+
+The cell fails if the forced arm SUCCEEDS (a silent bounce) or leaves the counter
+at 0 (the detector proves nothing).
+
+######## A CORRECTION TO DEFECT D3, MEASURED WHILE BUILDING THIS ########
+D3 was recorded as: plain dma_buf_attach() leaves peer2peer false, so xe migrates
+the BO to system RAM and the bounce happens silently. The first version of this
+cell injected exactly that -- and it did NOT reach the detector. xe returns
+-EOPNOTSUPP from dma_buf_attach() itself, because xe_dma_buf_attach() refuses a
+non-peer2peer attach whose BO cannot migrate to system memory, and a
+NEEDS_VISIBLE_VRAM BO cannot.
+
+So: **for the BO type arcwell requires, xe blocks that bounce earlier than this
+module does.** D3 as described applies to a BO that CAN migrate. The module's
+check is defence in depth against a future placement that can, and the injection
+flag is the only way to exercise it on this hardware. Recorded because the
+original D3 wording overstated what was reachable.

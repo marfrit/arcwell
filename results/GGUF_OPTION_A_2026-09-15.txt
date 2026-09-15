@@ -1,0 +1,60 @@
+M4_API.md option (A) — experts as ranges inside one GGUF shard
+Campaign: docs/campaigns/miss-tier-direct.md (gate limitation 2)
+Cell:  stub/test/aw_gguf_test.c
+File:  /flash/gguf/Qwen3.8-Flash-Next-UD-Q3_K_XL-00003-of-00003.gguf
+       39,992,153,376 B, real shipped artifact, copied from the model host
+Store: /flash = nvme0n1p3, ext4, noatime; partition start sector 100665344
+Card:  Arc Pro B60, 0000:0f:00.0 (A770 backlogged by operator decision)
+Module: arcwell with vram_usable=0x5fa000000 (clamped carve)
+Date:  2026-09-15
+
+######## THE LAYOUT, MEASURED ########
+40 GB file on fresh ext4: **24 extents** (filefrag merges to 22), average ~1.7 GiB.
+A 2,457,600 B expert slice therefore straddles a boundary about **0.14%** of the
+time. Far too rare to catch by sampling, so this cell reads FIEMAP first and
+places one slice DELIBERATELY across a boundary and one wholly inside an extent.
+
+######## GREEN ########
+file has 24 extents
+extent boundary at logical 1988100096 (1.85 GiB)
+  interior slice at 9830400 ; straddling slice at 1986871296
+  interior   slice -> 1 segment(s)
+      seg0 lba=109384448 bytes=2457600 dest_off=0
+  straddling slice -> 2 segment(s)
+      seg0 lba=113245856 bytes=1228800 dest_off=0
+      seg1 lba=113526784 bytes=1228800 dest_off=1228800
+  DMA'd 3 segments, 4915200 bytes
+  interior   slice verified against pread
+  straddling slice verified against pread
+  via_host_bounce=0
+RESULT=PASS
+
+######## RED: partition offset dropped ########
+  interior   slice -> seg0 lba=8719104   (vs 109384448 correct)
+  straddling slice -> seg0 lba=12580512 seg1 lba=12861440
+  interior   slice MISMATCH
+  straddling slice MISMATCH
+RESULT=FAIL -- VRAM does not match the file
+
+######## WHAT THIS CLOSES ########
+The gate was measured against a synthetic option (B) store: one file per expert,
+fallocate'd, one extent each — the recommended layout and the easy case. This is
+the layout the shipped artifact actually uses, and it works:
+
+- the file->LBA translation handles extent spanning, splitting a slice into two
+  requests at different dest_offsets in one buffer;
+- the two halves land 280,928 sectors apart — a real physical discontinuity — and
+  reassemble correctly in VRAM;
+- both slices byte-match an ordinary pread of the same file range;
+- via_host_bounce stays 0.
+
+M4_API.md's own words for option (A): "an expert can span an extent boundary ->
+multi-segment DMA". Measured: it does, and it is handled.
+
+######## A REPORTING GAP, NOT A DATA GAP ########
+`aw_ioc_stats.segments` read **0** after a run that demonstrably moved 3 segments.
+The batch path updates `reads`, `batch_reads`, `bytes` and `max_inflight` but
+never `segments`. The uAPI documents that field as making gather visible
+("nonzero count means the extents were gathered"), so it is currently lying by
+omission. The per-request `out_segments` IS correct — it reports real bios since
+the BIO_MAX_VECS fix. Fix the aggregate counter.

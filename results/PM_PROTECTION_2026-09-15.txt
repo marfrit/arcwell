@@ -1,0 +1,37 @@
+arcwell — runtime-PM protection must outlive the module (BACKLOG item 23)
+GPU:  Intel Arc Pro B60 @ 0000:0f:00.0
+Date: 2026-09-15
+
+FAILURE THIS PREVENTS: runtime suspend on a GPU whose BAR is carved for p2pdma
+wedges the card permanently (GT reset fails -ETIMEDOUT, xe declares it wedged,
+every GEM_CREATE then returns -ECANCELED). This killed the A770 twice in one
+session. The carve is devres-owned by the pci_dev and outlives the module, so a
+module-lifetime pm_runtime_get_sync() is NOT sufficient: rmmod drops it and leaves
+a carved GPU free to suspend.
+
+FIRST ATTEMPT WAS WRONG, AND THE CELL CAUGHT IT. pm_runtime_forbid() was gated on
+!g_carve_count -- on THIS module instance creating a carve. A later instance that
+found existing carves took the aw_pages_present() short-circuit, never reached the
+carve path, and never forbade PM. That is the most dangerous case of all: a carved
+BAR with a module that believes it is protected.
+
+  after carve : p2pmem=256 MiB control=auto status=active
+  after rmmod : p2pmem=256 MiB control=auto status=active
+  RESULT=FAIL -- carve remains but runtime PM is back to auto; the GPU can suspend and wedge
+
+FIX: key the protection off "this BAR IS carved", not "we carved it". Every
+success path in aw_ensure_carved() -- pages already present, carve already covers,
+newly carved -- now calls aw_forbid_pm_once().
+
+######## VERIFIED ########
+control right after insmod (before any mapping): auto
+control after a buffer was mapped             : on
+forbid message count: 1
+rmmod rc=0
+control after rmmod: on   p2pmem still 256 MiB
+RESULT=PASS -- PM protection outlived the module on a carved BAR
+
+pm_runtime_forbid() is DEVICE state, not module state, which is the whole point:
+unloading arcwell can no longer strand a carved GPU. Operators re-enable with
+'echo auto > /sys/bus/pci/devices/<bdf>/power/control' only once the carves are
+gone, i.e. after a rebind or reboot.

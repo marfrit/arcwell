@@ -1,0 +1,37 @@
+AW_IOC_SUBMIT_BATCH / AW_IOC_BATCH_WAIT — the async split
+Cell: stub/test/aw_async_test.c   Card: Arc Pro B60   Date: 2026-09-15
+
+######## RESULT ########
+submit returned in 9745 us ; batch complete at 53242 us ; polls=17165 (all EAGAIN)
+collected: bytes=157286400 completed=64 segments=193 err=0
+submit is 18.3% of the batch's wall time -- the I/O is hidden
+4 batches submitted in 168453 us; batches_inflight=4
+all 4 collected, 629145600 bytes total
+via_host_bounce=0 segments=1158 batches=6 inflight_now=0
+closing fd with batch 6 still in flight (release must drain)
+RESULT=PASS ; kernel complaints: 0
+
+Four properties, each able to fail alone:
+ 1. submit returns before the I/O finishes -- 18.3% of wall time, not 100%;
+ 2. a poll while in flight returns -EAGAIN -- 17,165 times;
+ 3. the collected batch reports exact bytes (64 x 2,457,600), completed and
+    segments (193 bios ~= 3 per expert, matching 600 pages / BIO_MAX_VECS);
+ 4. four batches overlap and all collect; fd close with one outstanding drains.
+
+######## A COST TO DESIGN AROUND ########
+Submit is NOT free and gets worse under pressure: **9.7 ms unloaded, 42 ms each
+with four batches outstanding**. It builds ~192 bios per 64-expert batch (~600
+pages per expert, BIO_MAX_VECS-capped), so the cost scales with bytes queued and
+with contention for the bio mempool.
+
+Consequence for prefetch: prefer **smaller, more frequent batches** over few deep
+ones. A 64-expert batch commits ~10-42 ms of submit before anything can be
+collected, which is itself long enough to matter on a per-layer schedule.
+
+######## FIRST RUN FAILED, AND IT WAS THE CELL'S FAULT ########
+The first version polled a fixed 100,000 times, exhausted that in ~11 ms, and
+reported `completed 0 of 64`. 64 experts is 157 MB -- ~54 ms at the measured rate
+-- so the batch had simply not finished, and the zeros were an unfilled struct
+from the last -EAGAIN. A fixed poll count is the wrong instrument; the cell now
+polls briefly to PROVE in-flight status, then blocks. Recorded because the failure
+looked like a module bug and was not.

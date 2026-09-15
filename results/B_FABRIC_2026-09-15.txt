@@ -1,0 +1,58 @@
+B_FABRIC — host->device PCIe ceiling, measured
+Campaign: docs/campaigns/miss-tier-direct.md (entry criterion)
+Cell:     stub/test/aw_bfabric.c ; leg script starts its own sampler (SOP §1),
+          hard timeout -s KILL 300 (SOP §4), zombie sweep by pid (SOP §5)
+Host:     AMD B550M Pro4, Proxmox 7.0.14-12-pve, 64 GB RAM
+Runtime:  container OpenCL (NEO 26.27.39122.11), plain OpenCL, not arcint's staging ring
+Method:   pinned CL_MEM_ALLOC_HOST_PTR source -> device-resident CL_MEM_READ_WRITE,
+          64 non-blocking clEnqueueWriteBuffer of 2,457,600 B (the per-expert slice,
+          design-qwen-flash-next.md:1025), ONE clFinish per batch, median of 12 rounds
+Date:     2026-09-15
+
+######## RESULTS ########
+
+| card | PCI id | CPU root port | link | B_FABRIC (median) | % of theoretical |
+|---|---|---|---|---|---|
+| Arc Pro B60 | 0000:0f:00.0 | 00:03.1 | Gen4 x8 (~15.75 GB/s) | **13.99 GB/s** | 89% |
+| Arc A770 | 0000:06:00.0 | 00:01.2 | Gen3 x4 (~3.94 GB/s) | **1.84 GB/s** | 47% |
+
+B60   slot-sized  xfer=2457600 batch=64  best=13.99  median=13.99 GB/s
+      4KiB control xfer=4096   batch=64  best= 0.98  median= 0.96 GB/s   ratio 14.6x
+A770  slot-sized  xfer=2457600 batch=64  best= 1.84  median= 1.84 GB/s
+      4KiB control xfer=4096   batch=64  best= 0.38  median= 0.37 GB/s   ratio  5.0x
+
+######## THE CONTROL ########
+The cell is able to fail. A 4 KiB batch is latency-bound and must come out far
+slower in GB/s than a slot-sized one; within 2x would mean the harness is timing
+queue bookkeeping rather than bytes on the wire, and it reports RESULT=VOID.
+Both cards cleared it (14.6x, 5.0x).
+
+######## WHAT THIS SETTLES ########
+- The endpoint link registers are junk on this topology (both GPUs report Gen1 x1,
+  ~250 MB/s). The CPU root-port reading was right: B60 on Gen4 x8, A770 on a
+  chipset-attached Gen3 x4. 13.99 GB/s at 89% of theoretical confirms it.
+- **The A770 is ineligible for this campaign and the number says why.** At
+  1.84 GB/s its host-to-device ceiling is BELOW the NVMe's own ~2.3 GB/s raw read
+  (design-qwen-flash-next.md:1022). Nothing about a miss tier can be separated on
+  that card: every path into it is capped under the drive's supply rate.
+- The B60 is drive-bound, not fabric-bound: 13.99 GB/s of link against one NVMe's
+  ~2.3 GB/s. A single drive can use at most ~16% of that card's bus.
+
+######## AN OPEN QUESTION, NOT A CLAIM ########
+arcint's recorded miss-feed rate is 1.68 GiB/s = 1.80 GB/s "in-container through
+ZFS" (design-qwen-flash-next.md:1022). The A770's measured fabric ceiling is
+1.84 GB/s. Those are within 2%. The recorded figure is described as a filesystem
+read rate, which would not involve the GPU at all, so this may be coincidence —
+but if any part of that measurement ran through the A770, it priced the bus and
+attributed it to the drive. Worth one cell to separate; not asserted here.
+
+######## SAMPLER ########
+Armed and recording per SOP §1, watchdog set to SIGKILL below 4 GiB MemAvailable.
+Both legs completed in ~1 s, so the series is one sample, not a trace:
+  18:46:28 MemAvailable=57,984,956 kB  Shmem=32,892 kB  ARC=4.44 GiB  leg RSS=1,708 kB
+No memory pressure; the watchdog never approached its threshold. Recorded as a
+single sample rather than a series, because that is what it is.
+
+######## STILL MISSING FROM THE GATE ########
+B_P_host_warm, B_P_host_cold (the decisive one), B_P_arcwell — all on the B60,
+all against the same ext4 store once it exists.

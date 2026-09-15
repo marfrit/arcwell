@@ -1,0 +1,36 @@
+arcwell M0 acceptance cell — raw output
+Host: target box (AMD B550M Pro4, Proxmox 7.0.14-12-pve)
+GPU:  Intel Arc A770 [8086:56a0] @ 0000:06:00.0, BAR2 0x7800000000 (16 GiB)
+NVMe: Samsung SM961/PM961 [144d:a804] @ 0000:01:00.0, /dev/nvme0n1 (READ-ONLY)
+Cell: stub/src/aw_m0_gate.c   Date: 2026-09-15
+
+######## RED: mutate=1 at disk_off=0x1000000000 -- MUST FAIL ########
+[14756.944987] aw_m0_gate:   sg[0] phys=0x0000007a00000000 len=1048576 is_p2p=1
+[14757.346529] aw_m0_gate: queue blk_queue_pci_p2pdma=1
+[14757.353495] aw_m0_gate: submit_bio_wait() = 0
+[14757.444439] aw_m0_gate: crc_poison=0x9f9f4226 crc_vram=0x1f9e697e crc_host=0x1d01c2b9
+[14757.444443] aw_m0_gate: RESULT=FAIL -- VRAM content does not match disk
+
+######## GREEN: mutate=0 at disk_off=0x1000000000 -- MUST PASS ########
+[14757.463646] aw_m0_gate: ==== M0 ACCEPTANCE CELL [normal - must PASS] ====
+[14757.463651] aw_m0_gate: arc=0000:06:00.0 nvme=0000:01:00.0 bdev=/dev/nvme0n1 xfer=0x100000 disk_off=0x1000000000
+[14757.463655] aw_m0_gate: p2pmem already carved; alloc_sgl succeeded directly
+[14757.463656] aw_m0_gate: p2pmem sgl ok nents=1
+[14757.463657] aw_m0_gate:   sg[0] phys=0x0000007a00000000 len=1048576 is_p2p=1
+[14757.554135] aw_m0_gate: VRAM poisoned with 0xa5, crc=0x1869d5fa
+[14757.554142] aw_m0_gate: queue blk_queue_pci_p2pdma=1
+[14757.561170] aw_m0_gate: submit_bio_wait() = 0
+[14757.650830] aw_m0_gate: VRAM crc after DMA = 0x1d01c2b9
+[14757.652004] aw_m0_gate: control host read = 0
+[14757.652048] aw_m0_gate: crc_poison=0x1869d5fa crc_vram=0x1d01c2b9 crc_host=0x1d01c2b9
+[14757.652052] aw_m0_gate: RESULT=PASS -- disk bytes landed in Arc VRAM by controller DMA
+
+Supporting measurements, same session:
+  aw_dma_map_probe: RESULT=OK phys=0x0000007a00000000 -> dma_addr=0x00000000ff980000 len=0x10000
+  aw_dma_map_probe: translation=TRANSLATED (dma_addr != phys)
+  aw_dma_map_probe: pci_p2pdma_distance(arc -> nvme) = 8
+  aw_p2p_provider_probe: pcim_p2pdma_init() = 0 (ok)
+  aw_p2p_provider_probe: provider ok owner=0000:06:00.0 bus_offset=0x0
+  aw_p2p_provider_probe: calling pci_p2pdma_add_resource(bar=2, size=0x4000000, offset=0x200000000)
+  xe 0000:06:00.0: added peer-to-peer DMA memory 0x7a00000000-0x7a03ffffff
+  aw_p2p_provider_probe: pci_p2pdma_add_resource() = 0

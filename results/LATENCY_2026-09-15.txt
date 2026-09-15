@@ -1,0 +1,52 @@
+Per-expert latency — the metric the gate did not cover
+Campaign: docs/campaigns/miss-tier-direct.md
+Cell: stub/test/aw_bp.c with --experts 1 --iters 64 (no batching)
+Card: Arc Pro B60, 0000:0f:00.0   Store: /flash ext4, 2,457,600 B experts
+Date: 2026-09-15
+
+######## MEASURED ########
+64 sequential single-expert fetches, one at a time, nothing overlapped:
+
+| path            | wall / 64 | per expert | rate       |
+|-----------------|----------:|-----------:|-----------:|
+| arcwell, cold   |  0.072 s  | **1.125 ms** | 2.18 GB/s |
+| host, cold      |  0.099 s  |   1.547 ms | 1.59 GB/s |
+| host, warm      |  0.019 s  |   0.297 ms | 8.33 GB/s |
+
+arcwell wins the honest cold-vs-cold comparison, 1.125 against 1.547 ms.
+
+######## BUT SET IT AGAINST THE RECORD ########
+[record] docs/milestone-0.3.0.md M14: the host CPU kernel computes an expert in
+         **198 us** from RAM.
+[record] docs/milestone-0.3.0.md M9: after the flush fix, "avg copy 309->5
+         us/tensor", with tensor_loads = misses x 9, i.e. ~45 us of critical path
+         per expert once uploads are overlapped with compute.
+
+So a SYNCHRONOUS arcwell fetch at 1,125 us is:
+  ~5.7x slower than not fetching at all and computing the expert on the CPU;
+  ~25x the overlapped upload path's critical-path cost.
+
+**On the decode hot path, unprefetched, arcwell loses.** That is not a defect in
+the mechanism, it is a constraint on its use.
+
+######## THE CONSTRAINT THAT FOLLOWS ########
+arcwell is viable only ASYNCHRONOUSLY, with experts fetched ahead of the layer
+that needs them. Its advantages are bandwidth (1.84x the cold host path) and CPU
+(16.3x less per GiB) — both of which are throughput properties that only pay off
+when latency is hidden.
+
+Evidence that depth is the lever: the same path measures 2.18 GB/s serial and
+**2.91 GB/s at max_inflight=193** — 33% from concurrency alone, on a drive-bound
+card with the fabric 79% idle.
+
+M9 learned this for the host path already: "slot-upload time overlapped with
+compute instead of 309 us/tensor synchronous" is what took it from 0.4 to 9.1 t/s.
+An arcwell integration that issues AW_IOC_READ_BLOCKS from the layer that needs
+the expert would reproduce M9's original defect with a worse constant.
+
+######## WHAT IS STILL NOT MEASURED ########
+- Whether prefetch actually hides it, i.e. arcwell issued N layers ahead against a
+  real routing trace. That needs the router's lookahead, so it is integration
+  work, not a bandwidth cell.
+- Queue-depth scaling beyond 193 in flight.
+- B_P_host against arcint's own staging ring (gate limitation 1, still open).

@@ -1,0 +1,8 @@
+/aw_selftest
+/libarcwell.a
+/*.o
+.pytest_cache/
+__pycache__/
+refs/
+__pycache__/
+*.pyc

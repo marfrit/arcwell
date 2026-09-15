@@ -1,0 +1,59 @@
+arcwell — Arc Pro B60 parity (BACKLOG item 19)
+The mission statement names the A770 AND the B60. Everything up to this point was
+A770-only. This file records the B60 reaching the same state, red-first.
+
+GPU:  Intel Arc Pro B60 / Battlemage G21 [8086:e211] @ 0000:0f:00.0 (renderD129)
+      BAR2 = 0x6000000000, length 0x800000000 (32 GiB)
+      IOMMU group 2  -- DIFFERENT from the NVMe's group 0
+NVMe: Samsung SM961/PM961 @ 0000:01:00.0, /dev/nvme0n1, READ-ONLY
+Date: 2026-09-15
+
+######## dma_map_resource on B60 BAR2 for the NVMe device ########
+aw_dma_map_probe: arc  0000:0f:00.0 BAR2 phys=0x0000006000000000 len=0x0000000800000000
+aw_dma_map_probe: pci_p2pdma_distance(arc -> nvme) = 6
+aw_dma_map_probe: RESULT=OK phys=0x0000006040000000 -> dma_addr=0x00000000b83d0000 len=0x10000
+aw_dma_map_probe: translation=TRANSLATED
+aw_dma_map_probe: dma_mask=0xffffffffffffffff  this address fits the mask
+
+FINDING: the B60 sits in a DIFFERENT IOMMU group from the NVMe controller and it
+does not matter. dma_map_resource() maps into the NVMe device's own domain
+regardless of which group the provider is in. An earlier note in this campaign
+treated shared-group-0 as a reason the A770 was the right first target; that
+reason does not hold. Also note distance = 6 here versus 8 for the A770, i.e. a
+shorter path through the topology.
+
+######## p2pdma provider + carve ########
+aw_p2p_provider_probe: pcim_p2pdma_init() = 0 (ok)
+aw_p2p_provider_probe: provider ok owner=0000:0f:00.0 bus_offset=0x0
+aw_p2p_provider_probe: pci_p2pdma_distance() = 6 -> supported (THRU_HOST_BRIDGE)
+aw_p2p_provider_probe: calling pci_p2pdma_add_resource(bar=2, size=0x4000000, offset=0x40000000)
+aw_p2p_provider_probe: pci_p2pdma_add_resource() = 0
+
+######## M0 gate — RED then GREEN ########
+RED : sg[0] phys=0x0000006040000000 len=1048576 is_p2p=1
+      queue blk_queue_pci_p2pdma=1 ; submit_bio_wait() = 0
+      crc_poison=0x1869d5fa crc_vram=0x0189fe54 crc_host=0x1d01c2b9
+      RESULT=FAIL -- VRAM content does not match disk
+GREEN: sg[0] phys=0x0000006040000000 len=1048576 is_p2p=1
+      queue blk_queue_pci_p2pdma=1 ; submit_bio_wait() = 0
+      crc_poison=0x1869d5fa crc_vram=0x1d01c2b9 crc_host=0x1d01c2b9
+      RESULT=PASS -- disk bytes landed in Arc VRAM by controller DMA
+
+crc_host matches the A770 run exactly (same LBA range), an independent
+consistency check across the two cards.
+
+######## BO gate — RED then GREEN ########
+arcwell: ready. arc=0000:0f:00.0 BAR2=0x0000006000000000+0x0000000800000000 nvme=0000:01:00.0
+RED : AW_IOC_MAP_BUFFER ok handle=1 out_flags=0x1 (REQUIRE_P2P honoured)
+      stats: reads=1 bytes=1048576 us=7053 segments=256 via_host_bounce=0
+      RESULT=FAIL -- BO content does not match disk
+GREEN: AW_IOC_MAP_BUFFER ok handle=2 out_flags=0x1 (REQUIRE_P2P honoured)
+      stats: reads=2 bytes=2097152 us=8171 segments=512 via_host_bounce=0
+      RESULT=PASS -- disk bytes landed in a GPU-owned BO, verified through its xe mapping
+kernel: sg[0] iova=0x00000000a6300000 -> phys=0x00000065f8b00000 len=1048576
+        carved BAR2 [0x00000065f8a00000 +200000) as P2P memory
+        MAP_BUFFER handle=2 npages=256 bytes=1048576 peer2peer=1
+
+NOT A PERFORMANCE CLAIM: the us= figures are raw observations from an unoptimised
+single-shot path. No comparison with the 309 us/tensor incumbent is made; that
+needs the benchmark cell of ENGINEER_PROMPT.md §6, which does not exist.

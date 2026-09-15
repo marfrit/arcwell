@@ -1,0 +1,125 @@
+arcwell — END-TO-END (BACKLOG item 15b). THE PRIMARY OBJECTIVE.
+Cell: stub/test/aw_e2e_test.c against stub/src/arcwell.c
+Chain: NVMe controller --DMA--> Arc VRAM BO --dma-buf import--> OpenCL kernel
+GPU:  Intel Arc Pro B60 @ 0000:0f:00.0 (renderD129), NEO 26.27.39122.11
+NVMe: Samsung SM961/PM961 @ 0000:01:00.0, /dev/nvme0n1, opened READ-ONLY
+Env:  chroot into the runtime container rootfs on the host (operator's decision: the container
+      was a packaging convenience, and its cgroup2 device filter blocked
+      /dev/arcwell; a chroot has the OpenCL runtime and host device access both)
+Date: 2026-09-15
+
+--expect was computed on the HOST from the raw block device:
+  32-bit little-endian word sum of 1 MiB at offset 0x1000000000 = 0x928a26d1
+so the bytes the GPU kernel summed are provably the disk's bytes.
+
+######## RED: --mutate MUST FAIL ########
+==== arcwell END-TO-END [MUTATED - MUST FAIL] ====
+BO poisoned with 0xa5
+arcwell: 1048576 bytes DMA'd into the BO, 256 segments
+MUTATED one word after the CPU sum
+device: Intel(R) Arc(TM) Pro B60 Graphics
+same dma-buf imported into OpenCL
+fenced on cl_event (ENGINEER_PROMPT.md §2)
+stats: reads=1 bytes=1048576 us=1157 segments=256 via_host_bounce=0
+cpu_sum=0x928a26d1 gpu_sum=0x4be567e8 expect=0x928a26d1
+RESULT=FAIL -- GPU does not see what is in the BO
+red exit=1
+
+######## GREEN: MUST PASS ########
+==== arcwell END-TO-END [normal - must PASS] ====
+BO poisoned with 0xa5
+arcwell: 1048576 bytes DMA'd into the BO, 256 segments
+device: Intel(R) Arc(TM) Pro B60 Graphics
+same dma-buf imported into OpenCL
+fenced on cl_event (ENGINEER_PROMPT.md §2)
+stats: reads=2 bytes=2097152 us=2305 segments=512 via_host_bounce=0
+cpu_sum=0x928a26d1 gpu_sum=0x928a26d1 expect=0x928a26d1
+RESULT=PASS -- NVMe bytes reached an OpenCL kernel on Intel(R) Arc(TM) Pro B60 Graphics with no host bounce
+green exit=0
+
+Four independent links, each able to fail on its own:
+  1. the 0xA5 poison is gone      -> arcwell wrote into the BO
+  2. gpu_sum == cpu_sum           -> the GPU reads what is in the BO
+  3. cpu_sum == expect            -> those bytes are the disk's bytes
+  4. via_host_bounce == 0         -> nothing transited system RAM
+ONE BO and ONE dma-buf fd serve both halves; there is no second buffer anywhere.
+
+NOT A PERFORMANCE CLAIM: us= figures are raw observations from an unoptimised
+single-shot path. No comparison with the 309 us/tensor incumbent is made; that
+needs the benchmark cell of ENGINEER_PROMPT.md §6, which does not exist.
+
+######## COLLATERAL DAMAGE, SAME SESSION ########
+The A770 (0000:06:00.0) was wedged by this campaign and is NOT usable:
+  power/runtime_status=error, usage=9
+  xe 0000:06:00.0: [drm] *ERROR* Tile0: GT0: runtime suspend failed (-ETIMEDOUT)
+  xe 0000:06:00.0: Runtime PM usage count underflow!
+Every DRM_IOCTL_XE_GEM_CREATE on that card now returns -EINVAL, for every process
+on the machine, in the container and in the chroot alike. `echo on >
+power/control` does not recover it. Needs a driver rebind or a reboot.
+
+CAUSE: a p2pdma carve on BAR2 is incompatible with GPU runtime suspend. The carve
+creates ZONE_DEVICE pages backed by the BAR; when xe then tries to put the device
+in D3 the suspend times out and the device latches into the error state.
+FIX APPLIED: arcwell now takes pm_runtime_get_sync() on the GPU at module load
+and puts it at unload, so the suspend attempt is never made. The B60 run above was
+performed with that fix in place and the B60 stayed healthy
+(runtime_status=active).
+RESIDUAL HAZARD: carves are devres-owned by the pci_dev and outlive the module, so
+after rmmod a carved GPU is again free to attempt suspend. Do not leave a carved
+GPU idle with arcwell unloaded until carve release exists.
+
+######## POST-REBOOT: A770 PARITY ########
+After the reboot cleared both cards (carves gone, runtime_status=suspended,
+usage=0, no xe errors), the end-to-end cell was re-run on the A770 with the
+runtime-PM fix in place:
+
+RED : stats: reads=1 bytes=1048576 us=1401 segments=256 via_host_bounce=0
+      cpu_sum=0x928a26d1 gpu_sum=0x4be567e8 expect=0x928a26d1
+      RESULT=FAIL -- GPU does not see what is in the BO
+GREEN: stats: reads=2 bytes=2097152 us=2608 segments=512 via_host_bounce=0
+      cpu_sum=0x928a26d1 gpu_sum=0x928a26d1 expect=0x928a26d1
+      RESULT=PASS -- NVMe bytes reached an OpenCL kernel on Intel(R) Arc(TM) A770 Graphics with no host bounce
+
+A770 PM state afterwards: status=active usage=3, no runtime-suspend failure, no
+underflow. The pm_runtime_get_sync() fix prevents the wedge.
+
+BOTH CARDS now pass the full chain: A770 and Arc Pro B60.
+
+######## NEW PROBLEM: 128 MiB CARVE MAKES CPU READS OF THE BO PATHOLOGICAL ########
+On the clean post-reboot BAR, arcwell's carve logic chose the intended 128 MiB
+section granule (p2pmem size went 0 -> 128 MiB for the whole session, instead of
+2 MiB per couple of BOs). That part of BACKLOG item 16 works.
+
+But a 20-iteration loop then hung. The test process sat at 98.5% CPU for 12
+minutes in USERSPACE -- State R, wchan 0, empty kernel stack, so not blocked in
+the kernel -- and host load reached 23. Killed manually.
+
+The loop it was in is the CPU-side verification in aw_e2e_test: the poison check
+and cpu_sum both read the whole 1 MiB BO through its xe mmap.
+
+HYPOTHESIS (not yet confirmed): memremap_pages() over a 128 MiB range changes the
+kernel's mapping of that physical range, and a BO allocated inside it loses
+write-combining, degrading to uncached. The arithmetic fits: 262144 four-byte
+uncached PCIe reads at ~2-4 us each is ~8-17 minutes, against the observed ~12.
+With 2 MiB carves the same code completed in seconds.
+
+WHY IT MAY NOT MATTER: the objective is GPU consumption, and gpu_sum is computed
+by the OpenCL kernel, which was never the slow part. Only the CPU-side checks are
+affected. But it does mean CPU-side verification is not viable over large carves,
+and it needs settling before the carve granule is called done.
+
+TO CONFIRM: map a BO inside and outside a 128 MiB carve and time a fixed-size CPU
+read of each; compare against /sys/kernel/debug/x86/pat_memtype_list.
+
+######## CORRECTION, added 2026-09-15 ########
+The hypothesis above is DISPROVED. See results/WC_CARVE_2026-09-15.txt. The same
+BO reads at the same rate before and after the carve that covers it (1.00x), and
+an A770 that has never been carved reads SLOWER than the carved B60. CPU reads of
+VRAM through a WC mmap cost ~1.4 us per access regardless. The twelve minutes was
+a byte-wise 1 MiB loop run twenty times, not a lost write-combining attribute.
+The "TO CONFIRM" above was carried out; this is its answer.
+
+######## REDACTION ########
+Host, container and path names were replaced with role words before
+publication (CLAUDE.md: this repository is public). Measurements,
+timings and kernel output are unaltered.

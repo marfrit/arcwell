@@ -1,0 +1,105 @@
+==== 0.0.1 publication regression ====
+date: 2026-09-15
+purpose: prove that removing eleven files and rewriting stub/src/Makefile did not
+         change the product, and that every acceptance cell still holds red-first.
+
+THE STRONGEST STATEMENT FIRST. The tree that ships builds a module whose
+srcversion is BYTE-IDENTICAL to the one that produced every measurement in
+results/:
+
+    fresh (this tree)   : D28A49C0C00071F811D65EF
+    loaded (measurement): D28A49C0C00071F811D65EF
+
+So the removals took away files that contributed nothing to the shipped object,
+which is exactly the claim being made about them.
+
+Build, from a clean tree, against the running kernel's headers:
+
+    $ make -C /lib/modules/$(uname -r)/build M=$(pwd) modules
+    MAKE_RC=0
+    arcwell.ko  aw_dma_map_probe.ko  aw_m0_gate.ko  aw_p2p_provider_probe.ko
+
+On insmod, udev created /dev/arcwell as crw-rw---- root:render without help, so
+packaging/dkms/99-arcwell.rules does what it claims.
+
+TWO CELL DEFECTS FOUND AND FIXED WHILE RUNNING THIS
+
+1. aw_batch_test read `max_inflight` as if it described the batch it had just
+   submitted. It does not: it is a MODULE-GLOBAL HIGH-WATER MARK that is never
+   reset, so an earlier, larger run leaves it high and the leg silently stops
+   testing anything. It printed "note: max_inflight=193, expected 16" and passed.
+   This is the same defect class as the absolute via_host_bounce assertions fixed
+   earlier in the campaign, in a second place. The cell now takes a baseline and
+   says which of the two readings it got. On a freshly loaded module:
+
+       max_inflight 0 -> 16: THIS batch raised the mark to N, one bio per buffer
+
+   On a dirty module it now declines to conclude, in as many words, instead of
+   printing a number that looks like a result.
+
+2. aw_batch_test and aw_lifecycle_test took the DRM node as a bare positional
+   argument while every other cell takes --drm PATH. Passing --drm to them
+   silently opened nothing and they reported "FAIL -- open drm". Both now accept
+   either spelling.
+
+######## RAW ########
+$ uname -r; date -u; cat /sys/module/arcwell/srcversion
+7.0.14-12-pve
+Tue Sep 15 07:29:01 PM UTC 2026
+D28A49C0C00071F811D65EF
+
+############ RED LEGS — every one must FAIL ############
+$ ./aw_bo_test --mutate --drm /dev/dri/renderD129
+==== arcwell BO acceptance [MUTATED - MUST FAIL] ====
+RESULT=FAIL -- BO content does not match disk
+exit=1
+$ ./aw_gguf_test --mutate --drm /dev/dri/renderD129
+==== GGUF option (A) [MUTATED: partition offset dropped - MUST FAIL] ====
+RESULT=FAIL -- VRAM does not match the file
+exit=1
+$ ./aw_bounce_test --drm ... --expect-bounce   (with debug_force_bounce=1)
+  MAP_BUFFER rc=-1 errno=Operation not supported ; via_host_bounce 0 -> 1 (delta 1)
+RESULT=PASS -- detected, counted (+1) and refused with Operation not supported
+exit=0
+$ ./aw_wc_test --drm /dev/dri/renderD129 --mutate
+slowdown factor: 1056.56x  (threshold 10x)
+VERDICT: item 20 is CONFIRMED — the carve degrades the CPU mapping
+exit=2
+
+############ GREEN LEGS ############
+$ ./aw_bo_test --drm /dev/dri/renderD129
+RESULT=PASS -- disk bytes landed in a GPU-owned BO, verified through its xe mapping
+exit=0
+$ ./aw_batch_test --drm /dev/dri/renderD129
+RESULT=PASS -- batch completes, drove 16 bios concurrently at the session high-water mark, and reports bad requests
+exit=0
+$ ./aw_async_test --drm /dev/dri/renderD129
+RESULT=PASS -- submit returns in 10022 us of 53457, poll reports EAGAIN, 4 batches overlap, close drains
+exit=0
+$ ./aw_lifecycle_test --drm /dev/dri/renderD129
+RESULT=PASS -- unmap drops registrations, bad handles rejected, close reclaims
+exit=0
+$ ./aw_bounce_test --drm /dev/dri/renderD129
+RESULT=PASS -- mapped peer-to-peer, counter unmoved
+exit=0
+$ ./aw_gguf_test --drm /dev/dri/renderD129
+RESULT=PASS -- option (A) ranges DMA'd from inside a 64-extent GGUF, interior and boundary-spanning, no host bounce
+exit=0
+$ ./aw_wc_test --drm /dev/dri/renderD129
+VERDICT: item 20 is NOT REPRODUCED — the carve does not change the CPU read rate
+exit=0
+
+NOT RE-RUN THIS TURN, and why: aw_e2e_test, aw_cl_import_test, aw_bfabric and
+aw_bp need an OpenCL runtime. It lives in a container that is not permitted to
+open /dev/arcwell (its device cgroup allows the DRM major only), and the host
+that owns the module has no OpenCL runtime. Their sources are untouched by this
+turn -- git shows no modification -- and their results stand in
+results/E2E_2026-09-15.txt, results/CL_IMPORT_2026-09-15.txt and
+results/B_FABRIC. This is recorded as an unverified gap rather than glossed:
+the consumption leg was not re-executed against this exact tree, only the
+transfer legs were.
+
+######## REDACTION ########
+Host, container and path names were replaced with role words before
+publication (CLAUDE.md: this repository is public). Measurements,
+timings and kernel output are unaltered.
