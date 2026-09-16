@@ -1,0 +1,122 @@
+==== BACKLOG item 24 — option (B) on the dedicated ext4 partition ====
+date: 2026-09-16
+cell: stub/test/aw_expert_test.c
+module: srcversion 0CAA5C74C7EFBCD27125AD3 (the post-fix module)
+
+THE SUBSTRATE IS DONE. A raw ext4 partition, nothing between the filesystem and
+the device -- no LVM, no dm, no zvol -- starting at sector 100665344 (48.0 GiB).
+1700 expert files of 2457600 bytes. Every one of the 1700 resolves to EXACTLY ONE
+extent, flags `last,eof`, and there is not a single UNWRITTEN, DELALLOC, INLINE,
+ENCODED or UNKNOWN extent in the set. That is precisely what item 24 asked for.
+
+THE TRANSLATION IS DONE, RED-FIRST. `aw_fiemap` resolves a file to an absolute
+LBA and compares the raw device against the file's bytes; dropping the partition
+start (`--mutate`) makes it go red. Verified again today on the fixed module.
+
+WHAT WAS MISSING, AND WHY NOBODY NOTICED. `aw_gguf_test` covers option (A) --
+ranges inside one big shard -- and it needs an extent boundary to straddle. A
+single-extent expert file has none, so that cell structurally COULD NOT cover
+option (B). The layout the documentation actively RECOMMENDS was the one with no
+DMA cell behind it, while the fallback was tested. `aw_expert_test` closes that.
+
+RESULT: option (B) works. 32 experts, 78,643,200 bytes, one batch, every expert
+byte-verified against the ordinary filesystem path, via_host_bounce unmoved. The
+red leg drops the partition offset and fails on CONTENT, not on an error code --
+which is the entire reason a content check is there: the DMA succeeds and returns
+plausible bytes from 48 GiB earlier in the disk.
+
+A DOCUMENTATION DEFECT THIS CELL CAUGHT
+=======================================
+`docs/USING_ARCWELL.md` §5 and `README.md` both said the layout "gives exactly
+1 extent per expert and one DMA segment".
+
+The first half is true. **The second half was false and unachievable.** A segment
+is a bio; a bio holds at most BIO_MAX_VECS (256) pages = 1 MiB. These experts are
+2.34 MiB, so three bios is the floor NO layout can beat. Measured: 4 bios for one
+expert, settling to ~3.1/expert at scale.
+
+  experts:      1     2     4     8    16    32
+  segments:     4     8    14    26    50    99
+  per expert: 4.00  4.00  3.50  3.25  3.13  3.09     floor 3.00
+
+Linear, and converging on the floor. Nothing beyond the vector limit is splitting
+these transfers.
+
+Anyone sizing a batch against that sentence would have been wrong by a factor of
+three. Both documents are corrected: what the layout actually buys is that an
+expert is ONE REQUEST at one in_dest_offset, where under option (A) an expert
+straddling an extent boundary becomes two. The bio count is the block layer's
+business and is the same either way.
+
+This is the fourth instance this campaign of a claim that was never measured
+because the cell that would have measured it could not structurally reach it --
+after item 20's fitted arithmetic, max_inflight's module-global high-water mark,
+and the installer purge that ran on a host with only one version registered.
+
+ALSO CLOSES most of item 17 (scale beyond one 1 MiB single-segment BO): these are
+2.34 MiB buffers, multi-bio, 32 to a batch, byte-verified.
+
+######## RAW ########
+$ uname -r; date -u; cat /sys/module/arcwell/srcversion
+7.0.14-12-pve
+Wed Sep 16 06:43:55 AM UTC 2026
+0CAA5C74C7EFBCD27125AD3
+
+$ mount | grep flash ; cat /sys/class/block/nvme0n1p3/start
+/dev/nvme0n1p3 on /flash type ext4 (rw,noatime)
+partition start sector: 100665344
+$ lsblk -o NAME,TYPE /dev/nvme0n1p3   # nothing between fs and device
+NAME      TYPE
+nvme0n1p3 part
+
+$ filefrag /flash/experts/*.bin | extent-count histogram   # all 1700
+   1700 1 extent found
+$ distinct extent flags across all 1700
+   1700 last,eof
+$ grep -icE unwritten|delalloc|inline|encoded|unknown  -> 0
+
+$ queue limits that force the split
+  max_hw_sectors_kb    128
+  max_segments         33
+
+######## aw_expert_test --mutate  (partition offset dropped) ########
+==== option (B): one file per expert [MUTATED: partition offset dropped - MUST FAIL ON CONTENT] ====
+dir=/flash/experts part_start=100665344 (48.0 GiB) experts=8
+8 experts, each exactly 1 plain extent
+batch: completed=8 bytes=19660800 segments(delta)=26 err=0
+segments: 26 for 8 experts (3.25/expert); BIO_MAX_VECS floor is 3/expert => 24
+RESULT=FAIL -- expert_0592.bin: VRAM does not match the file (expected: the partition offset was dropped)
+exit=1
+
+######## aw_expert_test  (normal) ########
+==== option (B): one file per expert [normal - must PASS] ====
+dir=/flash/experts part_start=100665344 (48.0 GiB) experts=8
+8 experts, each exactly 1 plain extent
+batch: completed=8 bytes=19660800 segments(delta)=26 err=0
+segments: 26 for 8 experts (3.25/expert); BIO_MAX_VECS floor is 3/expert => 24
+all 8 experts verified against the filesystem path; via_host_bounce unmoved
+RESULT=PASS -- option (B) DMAs one-file-per-expert from the ext4 partition: one extent, one request, 3.25 bios/expert against a floor of 3, no host bounce
+exit=0
+
+######## scale to 32 experts, 78 MB in one batch ########
+==== option (B): one file per expert [normal - must PASS] ====
+dir=/flash/experts part_start=100665344 (48.0 GiB) experts=32
+32 experts, each exactly 1 plain extent
+batch: completed=32 bytes=78643200 segments(delta)=99 err=0
+segments: 99 for 32 experts (3.09/expert); BIO_MAX_VECS floor is 3/expert => 96
+all 32 experts verified against the filesystem path; via_host_bounce unmoved
+RESULT=PASS -- option (B) DMAs one-file-per-expert from the ext4 partition: one extent, one request, 3.09 bios/expert against a floor of 3, no host bounce
+exit=0
+
+######## segments per expert, measured not assumed ########
+  experts=1   segments(delta)=4
+  experts=2   segments(delta)=8
+  experts=4   segments(delta)=14
+  experts=8   segments(delta)=26
+  experts=16  segments(delta)=50
+  experts=32  segments(delta)=99
+
+######## REDACTION ########
+Host, container and path names were replaced with role words before
+publication (CLAUDE.md: this repository is public). Measurements,
+timings and kernel output are unaltered.

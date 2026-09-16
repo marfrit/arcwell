@@ -30,8 +30,8 @@ So the scope is **the whole tree**, not a range.
 
 ```
 branch  main
-commits 3 (root, the rev-5 concurrency fix, its hardware verification)
-files   65
+commits 4 (root, the rev-5 concurrency fix, its verification, rev-6 item 24)
+files   67
 ```
 
 The second commit is deliberate. 0.0.1 was published from a single clean root;
@@ -46,7 +46,7 @@ is amended:
 ```
 c78a29075b2e  KERNEL_FACTS.md
 2811d6470967  RTFM_DISPOSITION.md
-d6b1e93df85b  docs/USING_ARCWELL.md
+0b8175739bf2  docs/USING_ARCWELL.md
 ee7fd91256d8  docs/campaigns/miss-tier-direct.md
 e600faec6b20  packaging/dkms/arcwell-detect-vram
 10ca402b5e8d  packaging/dkms/install.sh
@@ -54,9 +54,10 @@ e600faec6b20  packaging/dkms/arcwell-detect-vram
 99485fe44c62  stub/src/arcwell.c
 6fd0b6b50a37  stub/tools/aw_fiemap.c
 13e33ce52288  stub/test/aw_wc_test.c
+991f75fe9e37  stub/test/aw_expert_test.c
 e0f7963e7e70  stub/test/aw_wait_race_test.c
 10f2d8ffeadc  HANDOFF.md
-454aeb5bef47  BACKLOG.md
+4de905948363  BACKLOG.md
 ```
 
 `stub/src/arcwell.c` and `stub/include/aw_uapi.h` both changed this revision —
@@ -79,7 +80,7 @@ Full inventory and tree hash:
 
 ```sh
 git ls-tree -r main | grep -v REVIEWER_PROMPT.md | LC_ALL=C sort -k4 | sha256sum
-# 60cc56646380c18f6f9b7c6dbfe296ad76f63fb7e89152a9c61a4752392f209b
+# 0c75171fce40e46e7659456f8a84f69b06f2bc5b265b51fdba5eca3fb7e42e37
 ```
 
 The exclude is not cosmetic. This prompt is a file in the tree it pins, so a hash
@@ -226,6 +227,8 @@ that is correct.
 | `stub/test/aw_bounce_test.c` | `BOUNCE_DETECTOR` |
 | `stub/tools/aw_fiemap.c` | `FIEMAP` |
 | `stub/test/aw_wc_test.c` | `WC_CARVE` |
+| `stub/test/aw_expert_test.c` | `EXPERT_OPTION_B` |
+| `stub/test/aw_wait_race_test.c` | `RACE_FIX` |
 | `stub/src/aw_m0_gate.c` | `M0_GATE` |
 | `stub/src/aw_dma_map_probe.c` | none — `BACKLOG.md` Closed item 3, `KERNEL_FACTS.md` |
 | `stub/src/aw_p2p_provider_probe.c` | none — `KERNEL_FACTS.md`, the B1/D4 disproof |
@@ -509,3 +512,42 @@ installed at all** — worse than the stranding the loop was written to prevent.
 Found by running the installer, not by reading it; fixed by purging first;
 verified with a planted stale version. That is two consecutive revisions where a
 packaging change looked right and was wrong. Weight §7.6 accordingly.
+
+## 14. Rev 6 — item 24, and a documentation defect the new cell caught
+
+The Operator provisioned the dedicated ext4 partition item 24 called for. I
+verified it rather than closing the row on the mount line, and the verification
+earned its keep.
+
+**Substrate: exactly as specified.** Raw partition, nothing between filesystem and
+device, start sector 100665344. All 1700 expert files resolve to exactly one
+extent with flags `last,eof`; zero non-plain extents in the set.
+
+**A structural test gap.** `aw_gguf_test` covers option (A) and needs an extent
+boundary to straddle, so a single-extent expert file is unreachable by it. The
+layout the docs *recommend* therefore had no DMA cell behind it while the fallback
+did. `stub/test/aw_expert_test.c` closes that: 32 experts, 78.6 MB, one batch,
+every expert byte-verified, `via_host_bounce` unmoved, red leg failing on content
+rather than on an error code.
+
+**The defect it caught is in my own documentation.** `docs/USING_ARCWELL.md` §5 and
+`README.md` claimed the layout gives "1 extent per expert and one DMA segment".
+A segment is a bio and a bio caps at `BIO_MAX_VECS` (256) pages = 1 MiB; these
+experts are 2.34 MiB, so three bios is the floor. Measured 4 for one expert,
+converging to 3.09 at 32. **Anyone sizing a batch against that sentence was wrong
+by a factor of three.** Both documents corrected to say what the layout actually
+buys — one *request* per expert, not one bio.
+
+Worth your attention: my first version of the cell asserted `segments == experts`
+and went red against a **correct** module. The assertion was wrong, not the code,
+and I only found out because I ran it. Please check the corrected assertion is not
+now so loose that it cannot fail — it allows up to one extra bio per expert over
+the floor, and I would rather you told me that window is too wide than discover it
+the same way.
+
+**Standing pattern, fourth instance.** Item 20's fitted arithmetic,
+`max_inflight`'s module-global high-water mark, the installer purge tested where
+it could not fail, and now a documented claim whose cell could not structurally
+reach it. Each was individually defensible; together they say "there is a cell for
+this" was being read as "this is measured". If you see a fifth, it is the finding,
+not the instance.

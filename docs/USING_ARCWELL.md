@@ -124,8 +124,16 @@ Three rules, each learned by a cell going red:
   production.
 
 Layout matters: one file per expert, `fallocate`d, gives exactly **1 extent per
-expert** and one DMA segment. Ranges inside a big GGUF work too, but some will
-split.
+expert**, so an expert is **one request** at one `in_dest_offset`. Ranges inside a
+big GGUF work too, but an expert that straddles an extent boundary becomes **two**
+requests into the same buffer.
+
+**It does not make an expert one bio, and an earlier revision of this document
+wrongly said it did.** A bio holds at most `BIO_MAX_VECS` (256) pages = 1 MiB, so
+any expert larger than that is split regardless of layout — measured at 4 bios for
+a 2.34 MiB expert (`results/EXPERT_OPTION_B_2026-09-16.txt`). Size batches against
+the request count, which the layout controls, not against the segment count, which
+it does not.
 
 ## 6. Requirements and limits
 

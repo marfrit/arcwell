@@ -181,7 +181,7 @@ never invoked on this path. B1 only ever mattered for the block-layer route.
 | 21 | **Buffer lifecycle in the API** — `AW_IOC_UNMAP_BUFFER`, per-client ownership, `.open`/`.release`, kref against in-flight reads, `buffers_live`/`buffers_peak` | `DONE — PASSED` | `results/LIFECYCLE_2026-09-15.txt` |
 | 16 | Carve lifetime / granularity | `VERIFIED (granule) / OPEN (release)` | Section-granule logic **works**: on a clean BAR the first carve is 128 MiB and covers every later BO (p2pmem 0 -> 128 MiB for a whole session, vs 2 MiB per ~2 BOs before). Item 20, which was held against it, is disproved (`results/WC_CARVE_2026-09-15.txt`). What remains genuinely open is release: carves are devres-scoped and live until device rebind. |
 | 20 | **A 128 MiB carve appears to destroy write-combining for BOs inside it.** CPU read of a 1 MiB BO went from seconds to 12 minutes at 98.5% CPU in userspace. Hypothesis: `memremap_pages()` over the range downgrades WC to UC. | `DONE — DISPROVED` | `results/WC_CARVE_2026-09-15.txt`, cell `stub/test/aw_wc_test.c`. Same BO before/after the carve: 2.88 -> 2.88 MB/s, factor 1.00x. An **uncarved** A770 reads *slower* (1.59 MB/s) than the carved B60, so the ordering contradicts the hypothesis outright. Real cause: a CPU read of VRAM through a WC mmap costs ~1.4 us per access, carve or not; the loop that hung reads 1 MiB **byte-wise**, twenty times. What grew was the iteration count. Consequence for the product: none — no data path reads VRAM with the CPU. Unblocks item 16. |
-| 17 | Scale beyond one 1 MiB single-segment BO: multi-segment sgt, larger buffers, batch of experts | `TODO` | — |
+| 17 | Scale beyond one 1 MiB single-segment BO: multi-segment sgt, larger buffers, batch of experts | `DONE — VERIFIED` | `results/EXPERT_OPTION_B_2026-09-16.txt`: 2.34 MiB buffers (above the 1 MiB single-bio ceiling, so multi-bio by construction), 32 to a batch, 78.6 MB, all byte-verified. Segments scale linearly and converge on the `BIO_MAX_VECS` floor. |
 | 19 | **Arc Pro B60 parity** — the mission names both cards | `DONE — PASSED RED-FIRST on both gates` | `results/B60_PARITY_2026-09-15.txt` |
 | 13 | p2pdma provider probe (`aw_p2p_provider_probe.c`) | `DONE` | see Closed |
 | 12 | Rewrite `arcwell_nvme_vram.c` onto the corrected route | `SUPERSEDED` | Its premise ("no pages exist, so drop the block layer") was **wrong**: `arcwell.c` makes pages, via the `p2pdma` carve that D4 had made look impossible. The block-layer path is the shipped path. File deleted 2026-09-15. |
@@ -193,7 +193,7 @@ never invoked on this path. B1 only ever mattered for the block-layer route.
 |---|---|---|---|
 | 6 | xe-internal `pci_p2pdma_add_resource()` at probe time | `DEPRIORITISED` | Only needed for the *block-layer* production path, which the corrected route abandons. xe source **is** on the target (`/usr/src/xe-ringorder-7.0.14+p1/`, DKMS, already installed) if this is ever revived. |
 | 7 | Verify how xe's dma-buf exporter builds the VRAM sg table | `DONE` | see Closed — confirmed page-less, D1 fatal |
-| 24 | **Expert storage: dedicated ext4 partition** — operator decision 2026-09-15, resolving that neither ZFS nor btrfs provides FIEMAP. Needs: a raw partition (no LVM/dm/zvol beneath), one file per expert via `fallocate` for single-extent layout, and a userspace file->LBA translation that adds the partition start and rejects UNWRITTEN/DELALLOC/INLINE/ENCODED extents. | `TODO` | next phase, unblocks integration |
+| 24 | **Expert storage: dedicated ext4 partition** | `DONE — VERIFIED RED-FIRST` | `results/EXPERT_OPTION_B_2026-09-16.txt`. Operator created `/dev/nvme0n1p3` ext4 on `/flash`, raw partition, nothing between fs and device, start sector 100665344. 1700 expert files, **all 1700 exactly one extent**, flags `last,eof`, zero non-plain extents. `aw_fiemap` red-first on the translation; new cell `aw_expert_test.c` DMAs 32 experts (78.6 MB) in one batch, every one byte-verified, `via_host_bounce` unmoved. |
 | 8 | Reconcile `HANDOFF.md` with the tree | `DONE` | 2026-09-15: status table was false on every row (it still said no bytes had ever landed); rewritten against `results/`. `stub/README.md` and `M4_API.md` likewise — both still described the tree as an unbuilt capability probe. |
 | 9 | Purge the leaked internal FQDN from git history | `DONE` | Operator ruling: 0.0.1 ships without history. `main` is an orphan root commit; `dev` (74 commits, 5 carrying FQDNs in messages) stays local and is not published. |
 | 11 | Obtain a kernel-module build host | `DONE` | see Closed |
@@ -927,3 +927,50 @@ It would exercise a double `kfree()` in a live kernel on a host running unrelate
 containers; the likely result is a panic. The red legs show the assertions
 discriminate; they do not show the cell would have caught the original bug on a
 running kernel, and that weaker claim is the only one made.
+
+### T25 — 2026-09-16 — item 24 closed; the recommended layout had no cell, and the docs were wrong about it
+
+Operator: *"#24 is done"* — `/dev/nvme0n1p3` ext4 on `/flash`. Verified rather than
+taken on the mount line, and the verification found something.
+
+**The substrate is exactly what item 24 specified.** Raw partition, nothing
+between filesystem and device, start sector 100665344. 1700 expert files, and
+**all 1700 resolve to exactly one extent**, flags `last,eof`, with zero
+UNWRITTEN/DELALLOC/INLINE/ENCODED/UNKNOWN extents in the whole set.
+
+**The gap was a structural one.** `aw_gguf_test` covers option (A) — ranges inside
+one big shard — and it needs an extent boundary to straddle. A single-extent
+expert file has none, so that cell **could not** reach option (B). The layout the
+documentation actively *recommends* was the one with no DMA cell behind it, while
+the fallback was tested. `stub/test/aw_expert_test.c` closes it: 32 experts,
+78.6 MB, one batch, every expert byte-verified against the filesystem path,
+`via_host_bounce` unmoved. Red leg drops the partition offset and fails on
+**content**, not on an error code — the DMA succeeds and returns plausible bytes
+from 48 GiB earlier in the disk, which is exactly why a content check is there.
+
+**The cell immediately caught a documentation defect — in my own text.**
+`docs/USING_ARCWELL.md` §5 and `README.md` both claimed the layout gives "1 extent
+per expert **and one DMA segment**". The second half is false and was never
+achievable: a segment is a bio, a bio holds at most `BIO_MAX_VECS` (256) pages =
+1 MiB, and these experts are 2.34 MiB. Three bios is the floor no layout can beat.
+
+  experts:      1     2     4     8    16    32
+  segments:     4     8    14    26    50    99
+  per expert: 4.00  4.00  3.50  3.25  3.13  3.09    (floor 3.00)
+
+Linear, converging on the floor. My first version of the cell asserted
+`segments == experts` and went red on the *correct* module — the assertion was
+wrong, not the code. Both documents now say what the layout actually buys: an
+expert is **one request** at one `in_dest_offset`, where under option (A) an
+expert straddling a boundary becomes two. The bio count is the block layer's
+business and is identical either way.
+
+**Fourth instance this campaign** of a claim that went unmeasured because the cell
+that would have measured it could not structurally reach it — after item 20's
+fitted arithmetic, `max_inflight`'s module-global high-water mark, and the
+installer purge tested on a host with only one version registered. The pattern is
+not carelessness in any single instance; it is that "there is a cell for this" was
+being read as "this is measured" without checking that the cell could fail.
+
+Item 17 closes with the same run: 2.34 MiB buffers are above the 1 MiB single-bio
+ceiling, so this is multi-bio by construction, 32 to a batch, all verified.

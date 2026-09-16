@@ -97,7 +97,7 @@ behaviour, not an obstacle:
 | Buffer | a dma-buf fd exported from an xe VRAM BO: `NEEDS_VISIBLE_VRAM`, `CPU_CACHING_WC`, size a multiple of 64 KiB |
 | Alignment | `in_dest_offset` and transfer length page-aligned |
 | Storage | a filesystem that implements FIEMAP. **ZFS and btrfs do not.** ext4 does |
-| Layout | one file per expert, `fallocate`d, gives exactly one extent and one DMA segment per expert. Ranges inside a big GGUF also work, but some will span an extent boundary and become two requests |
+| Layout | one file per expert, `fallocate`d, gives exactly one extent per expert, so an expert is **one request**. Ranges inside a big GGUF also work, but some will span an extent boundary and become two. It does **not** make an expert one bio — `BIO_MAX_VECS` caps a bio at 1 MiB, so larger experts always split |
 | Topology | GPU and NVMe reachable for P2P (`pci_p2pdma_distance() >= 0`) |
 | Batch | 1..256 requests |
 
