@@ -886,3 +886,44 @@ Pushed anyway: a public repo carrying a known double free is worse than one
 carrying a reviewed, compiling, untested fix. That is a judgement call and it is
 recorded as one. First action when the host returns: `aw_wait_race_test` in all
 three legs, then the full suite, then re-pin.
+
+### T24 — 2026-09-16 — host returned; the fix is verified, and the installer was broken again
+
+`results/RACE_FIX_2026-09-16.txt`. Fresh boot, clean BAR, no arcint, both GPUs
+free. Everything T23 listed as unverified was executed.
+
+**The concurrency fix holds.** Builds clean on the *target* kernel with no
+warnings. `aw_wait_race_test` in all three legs: `--mutate` (asserting the buggy
+contract) goes red, `--serial` gives `-EINVAL` on the second collect, and the race
+itself gives exactly one collector with the other taking `-EBUSY` (-16) without
+ever waiting. Full suite re-passes, all four red legs red, and dmesg carries no
+arcwell WARN, BUG or oops.
+
+**The srcversion moved** — `D28A49C0C00071F811D65EF` -> `0CAA5C74C7EFBCD27125AD3`.
+Rev 4's "byte-identical to what produced every measurement" claim is void. Said
+plainly in the new result file rather than dropped: every other file in `results/`
+was measured on the pre-fix module. The change is confined to batch collection and
+`move_notify` and the suite re-passes, but the numbers were not re-taken.
+
+**I broke the installer again, and it was worse this time.** T22 added a loop that
+purges every registered arcwell version. It ran AFTER the staging step, and since
+the purged set normally includes the version being installed, it deleted
+`/usr/src/arcwell-<ver>` that had just been staged. `dkms add` then failed and the
+host was left with the module **removed and nothing installed** — strictly worse
+than the stranding the loop existed to prevent. Purge now runs first. Verified by
+planting a stale `arcwell/0.0.0`, running the installer, and watching both go and
+only 0.0.1 come back.
+
+Two turns running, a packaging change looked right and was wrong, and both times
+it was executing it that caught it. T22 claimed "verified end to end on hardware,
+not by reading" — that was true of the *version alignment* and false of the loop I
+added in the same turn, because the host already had only one version registered,
+so the ordering bug could not show itself. **A test that cannot fail is not a
+verification**, which is the same lesson as item 20 and as the `max_inflight`
+high-water mark. Third instance this campaign.
+
+**Deliberately not done:** the race cell was not run against the pre-fix module.
+It would exercise a double `kfree()` in a live kernel on a host running unrelated
+containers; the likely result is a panic. The red legs show the assertions
+discriminate; they do not show the cell would have caught the original bug on a
+running kernel, and that weaker claim is the only one made.

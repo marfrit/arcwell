@@ -1,0 +1,99 @@
+==== rev 5 verification: the concurrency fix on hardware ====
+date: 2026-09-16
+host: the target host, kernel 7.0.14-12-pve, Arc Pro B60, fresh boot (clean BAR)
+
+WHAT THIS CLOSES. REVIEWER_PROMPT.md section 13 and BACKLOG.md T23 shipped a
+memory-safety fix that was compile-checked only: built on a different kernel and
+a different architecture, never loaded, with a new cell that had never been run.
+That gap is now closed. Everything below was executed.
+
+  module srcversion   0CAA5C74C7EFBCD27125AD3   (fixed)
+  supersedes          D28A49C0C00071F811D65EF   (rev 4, the pre-fix module every
+                                                 other file in results/ was
+                                                 measured with)
+
+The srcversion MOVED, which is the point: rev 4's "byte-identical" pin is void
+and this file is what replaces it. Every other result in this directory was taken
+on the old module. The transfer paths they measured are untouched by this change
+-- it is confined to batch collection and move_notify -- and the suite below
+re-passes on the new module, but the numbers themselves were not re-taken.
+
+THE CELL THAT HAD NEVER RUN. aw_wait_race_test, all three legs. The red leg
+asserts the buggy contract (both collectors succeed) and goes red on the fixed
+module; the loser gets -EBUSY (-16) without waiting; the collected id is -EINVAL
+afterwards. No double free, no parked waiter, and dmesg has no arcwell WARN, BUG
+or oops this boot.
+
+NOT DONE, deliberately: the cell was NOT run against the PRE-FIX module. Doing so
+would exercise a double kfree() and a double kref_put() in a live kernel on a host
+that also runs unrelated containers, and the likely outcome is a panic. The red
+legs establish that the assertions discriminate; they do not establish that this
+cell would have caught the original bug on a running kernel. That distinction is
+left standing rather than papered over.
+
+A SECOND PACKAGING DEFECT, found by running the installer rather than reading it.
+The version-purge loop added in T22 ran AFTER the staging step, and since the
+purged set normally includes the version being installed, it deleted
+/usr/src/arcwell-<ver> that had just been staged. `dkms add` then failed, and the
+host was left with the module REMOVED and nothing installed -- a worse outcome
+than the stranding it was written to prevent. The loop now runs first. Verified
+by planting a stale arcwell/0.0.0 and watching both versions get removed and only
+0.0.1 return.
+
+That is two turns in a row where a packaging change looked right and was wrong.
+Both were caught by executing it; neither would have been caught by reading it.
+
+######## RAW ########
+$ uname -r; date -u; cat /sys/module/arcwell/srcversion; modinfo -n arcwell
+7.0.14-12-pve
+Wed Sep 16 04:08:28 AM UTC 2026
+0CAA5C74C7EFBCD27125AD3
+/lib/modules/7.0.14-12-pve/updates/dkms/arcwell.ko
+
+############ the cell that was written but never run ############
+$ ./aw_wait_race_test --drm ... --mutate      # asserts the BUGGY contract
+==== two collectors, one batch id [MUTATED: asserts the BUGGY contract - MUST FAIL] ====
+submitted batch id=1, 16 requests
+  A: rc=-16      bytes=0 completed=0
+  B: rc=0        bytes=16777216 completed=16
+RESULT=FAIL -- only 1 collector(s) succeeded; the buggy contract does not hold, which is correct
+exit=1
+
+$ ./aw_wait_race_test --drm ... --serial
+==== two collectors, one batch id [serial: second collect must be -EINVAL] ====
+submitted batch id=1, 16 requests
+  first collect rc=0 bytes=16777216 ; second collect rc=-22 (Invalid argument)
+RESULT=PASS -- the id dies with its collection
+exit=0
+
+$ ./aw_wait_race_test --drm ...
+==== two collectors, one batch id [normal] ====
+submitted batch id=1, 16 requests
+  A: rc=-16      bytes=0 completed=0
+  B: rc=0        bytes=16777216 completed=16
+  one collector took 16777216 bytes, the other got -EBUSY without waiting; id now -EINVAL; via_host_bounce=0
+RESULT=PASS -- exactly one collector, no double free, no parked loser
+exit=0
+
+############ full suite, red then green ############
+RED   aw_bo_test --mutate        RESULT=FAIL -- BO content does not match disk
+RED   aw_gguf_test --mutate      RESULT=FAIL -- VRAM does not match the file
+RED   aw_bounce_test --expect-bounce RESULT=PASS -- detected, counted (+1) and refused with Operation not supported
+RED   aw_wc_test --mutate        VERDICT: item 20 is CONFIRMED — the carve degrades the CPU mapping
+GREEN aw_bo_test                 RESULT=PASS -- disk bytes landed in a GPU-owned BO, verified through its xe mapping
+GREEN aw_batch_test              RESULT=PASS -- batch completes, drove 16 bios concurrently at the session high-water mark, and reports bad requests
+GREEN aw_async_test              RESULT=PASS -- submit returns in 10074 us of 53433, poll reports EAGAIN, 4 batches overlap, close drains
+GREEN aw_lifecycle_test          RESULT=PASS -- unmap drops registrations, bad handles rejected, close reclaims
+GREEN aw_bounce_test             RESULT=PASS -- mapped peer-to-peer, counter unmoved
+GREEN aw_gguf_test               RESULT=PASS -- option (A) ranges DMA'd from inside a 24-extent GGUF, interior and boundary-spanning, no host bounce
+GREEN aw_wc_test                 VERDICT: item 20 is NOT REPRODUCED — the carve does not change the CPU read rate
+
+############ kernel: any arcwell WARN/BUG/oops this boot? ############
+  none
+############ DKMS version purge, verified with a planted stale version ############
+  arcwell/0.0.1, 7.0.14-12-pve, x86_64: installed
+
+######## REDACTION ########
+Host, container and path names were replaced with role words before
+publication (CLAUDE.md: this repository is public). Measurements,
+timings and kernel output are unaltered.

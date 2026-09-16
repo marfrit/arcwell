@@ -30,8 +30,8 @@ So the scope is **the whole tree**, not a range.
 
 ```
 branch  main
-commits 2 (root + the rev-5 concurrency fix)
-files   64
+commits 3 (root, the rev-5 concurrency fix, its hardware verification)
+files   65
 ```
 
 The second commit is deliberate. 0.0.1 was published from a single clean root;
@@ -49,14 +49,14 @@ c78a29075b2e  KERNEL_FACTS.md
 d6b1e93df85b  docs/USING_ARCWELL.md
 ee7fd91256d8  docs/campaigns/miss-tier-direct.md
 e600faec6b20  packaging/dkms/arcwell-detect-vram
-85c68b8df496  packaging/dkms/install.sh
+10ca402b5e8d  packaging/dkms/install.sh
 6627f5c26c81  stub/include/aw_uapi.h
 99485fe44c62  stub/src/arcwell.c
 6fd0b6b50a37  stub/tools/aw_fiemap.c
 13e33ce52288  stub/test/aw_wc_test.c
 e0f7963e7e70  stub/test/aw_wait_race_test.c
 10f2d8ffeadc  HANDOFF.md
-e0f9d086ef1e  BACKLOG.md
+454aeb5bef47  BACKLOG.md
 ```
 
 `stub/src/arcwell.c` and `stub/include/aw_uapi.h` both changed this revision —
@@ -79,7 +79,7 @@ Full inventory and tree hash:
 
 ```sh
 git ls-tree -r main | grep -v REVIEWER_PROMPT.md | LC_ALL=C sort -k4 | sha256sum
-# 67fee7e5dbdc417149d0dea03be3b1d0b129b1a828092de21ac54e11a8fa9328
+# 60cc56646380c18f6f9b7c6dbfe296ad76f63fb7e89152a9c61a4752392f209b
 ```
 
 The exclude is not cosmetic. This prompt is a file in the tree it pins, so a hash
@@ -470,28 +470,42 @@ assuming (the audit is in `BACKLOG.md` T23).
 Findings 1 and 2 compound — either fix alone still leaves a defect — which is the
 part worth checking in the diff.
 
-**What you must not assume about this revision:**
+**VERIFIED ON HARDWARE — this supersedes the gap this section originally carried.**
 
-`data`, the machine with the Arc cards, went off the network partway through this
-work and has not come back. Therefore, stated plainly:
+`results/RACE_FIX_2026-09-16.txt`. The host came back; everything below was run,
+not reasoned about:
 
-- The fix **compiles clean with no warnings** — but on kernel 7.0.0-rc3 `aarch64`,
-  a *different kernel and a different architecture* from the target. That is a
-  syntax and type check, nothing more.
-- The fix has **never been loaded**. Not once.
-- `aw_wait_race_test.c` has **never been run**, in either leg. It is written and
-  unexecuted. Its green is unclaimed; so is its red.
-- No acceptance cell has been re-run since the change. The srcversion equality
-  that rev 4 rested on (`D28A49C0C00071F811D65EF`) is **void** — the module
-  source changed, and nothing has re-established what the new one does on
-  hardware.
+- builds clean on the **target** kernel (7.0.14-12-pve, x86_64), no warnings;
+- `aw_wait_race_test` in all three legs: `--mutate` goes red on the fixed module,
+  `--serial` gives `-EINVAL` on the second collect, the race gives exactly one
+  collector and `-EBUSY` (-16) for the other without waiting;
+- full suite re-passes, all four red legs red;
+- no arcwell `WARN`, `BUG` or oops in dmesg this boot;
+- DKMS reinstalled so the installed module is the fixed one, and the version
+  purge verified by planting a stale `arcwell/0.0.0`.
 
-I pushed it anyway, and that is a judgement you should second-guess: a public
-repository carrying a known double-free seemed worse than one carrying a reviewed,
-compiling, hardware-untested fix. The alternative — hold the fix until the host
-returns — leaves the corruption in the published tree in the meantime. Say so if
-you disagree; it is reversible.
+**The srcversion moved**: `D28A49C0C00071F811D65EF` → `0CAA5C74C7EFBCD27125AD3`.
+Rev 4's "byte-identical to what produced every measurement" pin is therefore
+**void**, and that is stated in the new result file rather than quietly dropped.
+Every other file in `results/` was measured on the pre-fix module. The change is
+confined to batch collection and `move_notify`, the transfer paths are untouched
+and the suite re-passes — but the numbers themselves were not re-taken, and you
+should treat that as the standing caveat on this revision.
 
-**The first thing to do when the host returns** is `aw_wait_race_test` in all
-three legs (normal, `--mutate`, `--serial`), then the full suite, then re-pin the
-srcversion. Until that happens this revision is source review only.
+**Two things I did NOT do, both deliberate:**
+
+1. The cell was **not** run against the pre-fix module. That would exercise a
+   double `kfree()` in a live kernel on a host running unrelated containers, and
+   the likely outcome is a panic. So the red legs show the assertions
+   discriminate; they do **not** show this cell would have caught the original bug
+   on a running kernel. Different claims, and only the weaker one is made.
+2. `results/` was not re-measured on the new module.
+
+**A second packaging defect, and it is the more embarrassing one.** The
+version-purge loop added last revision ran *after* the staging step, and since the
+purged set includes the version being installed it deleted the source that had
+just been staged. `dkms add` failed and the host was left with **no module
+installed at all** — worse than the stranding the loop was written to prevent.
+Found by running the installer, not by reading it; fixed by purging first;
+verified with a planted stale version. That is two consecutive revisions where a
+packaging change looked right and was wrong. Weight §7.6 accordingly.

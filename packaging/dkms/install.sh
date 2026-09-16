@@ -4,6 +4,18 @@ set -eu
 VER=$(awk -F'"' '/^PACKAGE_VERSION=/{print $2}' packaging/dkms/dkms.conf)
 SRC=/usr/src/arcwell-$VER
 
+# PURGE FIRST. This loop removes /usr/src/arcwell-<ver> for every registered
+# version, and $VER is normally one of them -- so running it AFTER staging
+# deletes the source that was just staged and `dkms add` then fails with the
+# module half-removed and nothing installed. Measured: it uninstalled a working
+# module and left the host with none.
+echo "== purging previously registered versions =="
+for old in $(dkms status 2>/dev/null | sed -n 's|^arcwell/\([^,:]*\).*|\1|p' | sort -u); do
+	echo "  removing arcwell/$old"
+	dkms remove -m arcwell -v "$old" --all 2>/dev/null || true
+	rm -rf "/usr/src/arcwell-$old"
+done
+
 echo "== staging $SRC =="
 rm -rf "$SRC"
 install -d "$SRC/include"
@@ -21,14 +33,6 @@ echo "== detector =="
 install -m755 packaging/dkms/arcwell-detect-vram /usr/local/sbin/arcwell-detect-vram
 
 echo "== dkms add/build/install =="
-# Remove EVERY registered arcwell, not just $VER. Removing only the target
-# version strands the previously installed one on any version bump: dkms keeps
-# building it, and two arcwell.ko then race for the same module name.
-for old in $(dkms status 2>/dev/null | sed -n 's|^arcwell/\([^,:]*\).*|\1|p' | sort -u); do
-	echo "  removing arcwell/$old"
-	dkms remove -m arcwell -v "$old" --all 2>/dev/null || true
-	rm -rf "/usr/src/arcwell-$old"
-done
 dkms add    -m arcwell -v "$VER"
 dkms build  -m arcwell -v "$VER"
 dkms install -m arcwell -v "$VER"
