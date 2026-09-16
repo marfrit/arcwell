@@ -176,11 +176,24 @@ struct aw_inflight {
 	struct aw_buffer **refs;
 	unsigned int nrefs, submitted, nbio;
 	u64 bytes;
+	/* Set while one thread owns the collection of this batch. Two threads
+	 * calling AW_IOC_BATCH_WAIT on the same id used to both xa_load() the
+	 * same pointer, both park on ba.done, and -- because complete() wakes
+	 * exactly one -- the winner would free this allocation while the loser
+	 * was still parked inside it. Claiming under cl->lock BEFORE waiting is
+	 * what makes that unrepresentable: the loser never reaches the wait. */
+	bool collecting;
 };
 
 struct aw_buffer {
 	u32 handle;
 	struct kref ref;
+	/* Set if move_notify ever fires. The pages array was resolved once, at
+	 * map time, and every bio is built from it; if the exporter moved the BO
+	 * those addresses are stale and any further transfer would DMA into
+	 * whatever now lives there. There is no way to recall bios already in
+	 * flight, so the only honest response is to refuse everything after. */
+	bool moved;
 	struct dma_buf *dbuf;
 	struct dma_buf_attachment *attach;
 	struct sg_table *sgt;
@@ -189,10 +202,26 @@ struct aw_buffer {
 	size_t length;
 };
 
+/* This must not fire. dma_buf_pin() is taken at map time (see aw_map_buffer
+ * step 3) and held for the buffer's whole life, and a pinned attachment is not
+ * movable. If it fires anyway the pin contract is broken by the exporter, and
+ * b->pages[] -- resolved once at map time and used to build every bio -- is
+ * stale.
+ *
+ * pr_warn alone was not a response to that. It left a buffer whose pages point
+ * at memory the GPU no longer owns still accepting transfers. Now the buffer is
+ * poisoned: every later lookup refuses it. Bios ALREADY in flight cannot be
+ * recalled, which is the part this cannot fix and does not pretend to -- hence
+ * WARN, so the trace names the caller rather than a bare line in dmesg.
+ */
 static void aw_move_notify(struct dma_buf_attachment *attach)
 {
-	/* We pin the attachment, so a move should not happen. Say so loudly. */
-	pr_warn("arcwell: move_notify fired on a pinned attachment\n");
+	struct aw_buffer *b = attach->importer_priv;
+
+	if (b)
+		WRITE_ONCE(b->moved, true);
+	WARN(1, "arcwell: move_notify fired on a PINNED attachment -- buffer %u poisoned, its pages are stale; in-flight bios cannot be recalled\n",
+	     b ? b->handle : 0);
 }
 
 static const struct dma_buf_attach_ops aw_attach_ops = {
@@ -435,6 +464,8 @@ static struct aw_buffer *aw_find_get(struct aw_client *cl, u32 handle)
 
 	xa_lock(&cl->buffers);
 	b = xa_load(&cl->buffers, handle);
+	if (b && unlikely(READ_ONCE(b->moved)))
+		b = NULL;	/* poisoned by move_notify; see aw_move_notify */
 	if (b)
 		kref_get(&b->ref);
 	xa_unlock(&cl->buffers);
@@ -465,8 +496,10 @@ static long aw_map_buffer(struct aw_client *cl, void __user *uarg)
 	if (IS_ERR(b->dbuf)) { rc = PTR_ERR(b->dbuf); b->dbuf = NULL; goto err; }
 
 	/* --- step 1: dynamic attach declaring peer2peer --- */
+	/* importer_priv is us: move_notify needs to reach the buffer to poison
+	 * it, and the attachment is the only handle it is given. */
 	b->attach = dma_buf_dynamic_attach(b->dbuf, &g_nvme->dev,
-					   &aw_attach_ops, NULL);
+					   &aw_attach_ops, b);
 	if (IS_ERR(b->attach)) { rc = PTR_ERR(b->attach); b->attach = NULL; goto err; }
 
 	/* --- step 2: THE CONTRACT. xe clears this silently. --- */
@@ -571,8 +604,12 @@ static void aw_batch_endio(struct bio *bio)
 	if (bio->bi_status && !ba->status)
 		ba->status = bio->bi_status;
 	bio_put(bio);
+	/* complete_all(), not complete(): it leaves the completion permanently
+	 * signalled, so a second observer (a poll that races the collector, or
+	 * release draining) sees "done" instead of parking forever on a
+	 * completion nobody will signal again. */
 	if (atomic_dec_and_test(&ba->pending))
-		complete(&ba->done);
+		complete_all(&ba->done);
 }
 
 /* Submit one request as however many bios BIO_MAX_VECS requires.
@@ -669,7 +706,7 @@ static long aw_read_blocks(struct aw_client *cl, void __user *uarg)
 	rc = aw_submit_request(b, &arg, &ba, &nbio);
 
 	if (atomic_dec_and_test(&ba.pending))
-		complete(&ba.done);
+		complete_all(&ba.done);
 	wait_for_completion(&ba.done);
 
 	if (!rc && ba.status)
@@ -745,7 +782,7 @@ req_failed:
 
 	/* Drop the submitter's reference; the last completion wakes us. */
 	if (atomic_dec_and_test(&ba.pending))
-		complete(&ba.done);
+		complete_all(&ba.done);
 	wait_for_completion(&ba.done);
 
 	if (ba.status && !hdr.out_err)
@@ -864,7 +901,7 @@ req_failed:
 	if (rc) {
 		/* cannot track it, so we must not return without waiting */
 		if (atomic_dec_and_test(&inf->ba.pending))
-			complete(&inf->ba.done);
+			complete_all(&inf->ba.done);
 		wait_for_completion(&inf->ba.done);
 		goto err;
 	}
@@ -872,7 +909,7 @@ req_failed:
 	/* Drop the submitter's reference. From here the last completion wakes it.
 	 * NOTE: we do NOT wait. That is the entire point of this call. */
 	if (atomic_dec_and_test(&inf->ba.pending))
-		complete(&inf->ba.done);
+		complete_all(&inf->ba.done);
 
 	hdr.out_batch_id = inf->id;
 	hdr.out_submitted = inf->submitted;
@@ -899,25 +936,55 @@ static long aw_batch_wait(struct aw_client *cl, void __user *uarg)
 	if (copy_from_user(&arg, uarg, sizeof(arg)))
 		return -EFAULT;
 
+	/* Claim the batch before waiting on it. Look-up and claim must be one
+	 * atomic step against cl->lock, or two collectors both get the pointer
+	 * and the first to finish frees it under the second. */
+	mutex_lock(&cl->lock);
 	inf = xa_load(&cl->batches, arg.in_batch_id);
-	if (!inf)
+	if (!inf) {
+		mutex_unlock(&cl->lock);
 		return -EINVAL;
+	}
+	if (inf->collecting) {
+		mutex_unlock(&cl->lock);
+		return -EBUSY;		/* another thread is collecting this id */
+	}
+	inf->collecting = true;
+	mutex_unlock(&cl->lock);
 
 	if (arg.in_timeout_us == 0) {
 		if (!try_wait_for_completion(&inf->ba.done))
-			return -EAGAIN;		/* still in flight; id stays valid */
+			goto again;		/* still in flight; id stays valid */
 	} else if (arg.in_timeout_us == U64_MAX) {
 		wait_for_completion(&inf->ba.done);
 	} else {
 		left = wait_for_completion_timeout(&inf->ba.done,
 					usecs_to_jiffies(arg.in_timeout_us) + 1);
 		if (!left)
-			return -EAGAIN;
+			goto again;
 	}
 
-	xa_erase(&cl->batches, arg.in_batch_id);
+	/* We hold the claim, so this erase cannot lose a race -- but check it
+	 * rather than assume it, because an ignored xa_erase() return is exactly
+	 * how the double free got in. */
+	mutex_lock(&cl->lock);
+	if (xa_erase(&cl->batches, arg.in_batch_id) != inf) {
+		inf->collecting = false;
+		mutex_unlock(&cl->lock);
+		return -EINVAL;
+	}
+	mutex_unlock(&cl->lock);
+
 	aw_inflight_finish(cl, inf, &arg);
 	return copy_to_user(uarg, &arg, sizeof(arg)) ? -EFAULT : 0;
+
+again:
+	/* Not finished: drop the claim so the caller (or another thread) can
+	 * poll again. The batch stays in the xarray and stays collectable. */
+	mutex_lock(&cl->lock);
+	inf->collecting = false;
+	mutex_unlock(&cl->lock);
+	return -EAGAIN;
 }
 
 static long aw_unmap_buffer(struct aw_client *cl, void __user *uarg)

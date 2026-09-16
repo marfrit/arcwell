@@ -819,3 +819,70 @@ installed module (`max_inflight 1 -> 16`).
 Pushed to GitHub, `main`, private repo. Checked before pushing: the remote `dev`
 is stale at 8 commits, so the five hostname-bearing commit messages never reached
 it, and neither remote branch carries a hostname.
+
+### T23 — 2026-09-16 — concurrency review: a double free and a hang in shipped code
+
+A review of rev 4 returned 22 findings. I audited all 22 against the tree rather
+than trusting the T-log; 17 were already fixed in rev 3/rev 4, **five were live**,
+and two of those were memory-safety bugs in a module that was by then public.
+
+**1+2 — the double free and the parked loser (`arcwell.c`).** `aw_batch_wait()`
+did `xa_load` → wait → `xa_erase` → `aw_inflight_finish()` with the erase's return
+ignored and no lock held across the sequence. Two threads waiting on one batch id
+both got the same pointer; both parked on `&inf->ba.done`; the completion path
+called `complete()`, which wakes exactly one; the winner ran the free path while
+the loser slept inside the allocation. Double `kfree(inf)`, double `kref_put()` on
+every buffer the batch referenced, and with `in_timeout_us == U64_MAX` the loser
+never wakes at all.
+
+The two halves compound, which is the part worth recording: fixing only the erase
+leaves the loser waking on freed memory; fixing only `complete()` leaves both
+collectors running the free path. Fixed together — claim the batch under
+`cl->lock` **before** waiting so a second collector returns `-EBUSY` without ever
+parking, check the erase return anyway, and `complete_all()` everywhere.
+`-EBUSY` is now in the uAPI contract, not an implementation accident.
+
+**This was my own open doubt, §7.1, which listed "two threads calling
+`AW_IOC_BATCH_WAIT` on one id" by name.** I wrote the doubt, shipped the code
+anyway, and a reviewer found the thing the doubt described. Writing a doubt down
+is not the same as clearing it, and §7 now says so in place of the old "convince
+yourself there is no path".
+
+**4 — `move_notify` was decoration.** A bare `pr_warn`. `b->pages[]` is resolved
+once at map time and every bio is built from it, so a moved buffer would have kept
+serving transfers pointed at memory the GPU no longer owned. Now `WARN` plus a
+poison flag that makes every later `aw_find_get()` refuse the buffer;
+`importer_priv` is set so the callback can reach it. Bios already in flight cannot
+be recalled and the comment says so rather than implying a completeness it has
+not got. `dma_buf_pin()` is genuinely held for the buffer's life, so this should
+never fire — but "should never fire" was the old justification for doing nothing.
+
+**3 — the missing cell.** `stub/test/aw_wait_race_test.c`: two threads, one
+barrier, one batch id. Asserts exactly one collector, `-EBUSY` for the other,
+real bytes for the winner, `-EINVAL` for the id afterwards. Two red legs —
+`--mutate` asserts the buggy contract and must fail, `--serial` requires the
+second sequential collect to be `-EINVAL`.
+
+**The 17 already-fixed findings** were re-checked, not assumed: bounce wording in
+`docs/USING_ARCWELL.md` and `aw_bo_test.c`, all six cells delta-based, the `the
+the` artifact, the bare hostname at `BACKLOG.md:209/:265` (now role words), §1/§3
+self-match excludes, §9's plain statement, §2-vs-§5 provenance, §4's arcint path.
+One near-miss: a naive grep said 13 result files lacked a redaction note, which
+looked like a live finding. It was not — only files that were actually scrubbed
+need one, and both of those (`CL_IMPORT`, `E2E`) carry it. I checked before
+reporting it rather than after.
+
+**NOT VERIFIED, and this matters more than anything above.** `data` went off the
+network mid-work — no ssh, no ICMP — and has not returned, so:
+
+- the fix **compiles clean, zero warnings**, but on 7.0.0-rc3 `aarch64` on a
+  different machine. A syntax and type check, nothing more.
+- the fix has **never been loaded**;
+- `aw_wait_race_test.c` has **never been run**, in any leg;
+- no acceptance cell has been re-run, so rev 4's srcversion pin
+  (`D28A49C0C00071F811D65EF`) is **void**.
+
+Pushed anyway: a public repo carrying a known double free is worse than one
+carrying a reviewed, compiling, untested fix. That is a judgement call and it is
+recorded as one. First action when the host returns: `aw_wait_race_test` in all
+three legs, then the full suite, then re-pin.

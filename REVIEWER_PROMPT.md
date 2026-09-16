@@ -30,9 +30,15 @@ So the scope is **the whole tree**, not a range.
 
 ```
 branch  main
-commits 1 (root)
-files   63
+commits 2 (root + the rev-5 concurrency fix)
+files   64
 ```
+
+The second commit is deliberate. 0.0.1 was published from a single clean root;
+the fix that followed is a separate commit rather than an amendment because by
+then the repository was public, and rewriting published history to hide that a
+double free shipped is not a thing this project should do. The bug and its fix
+are both in the log.
 
 Pinned by blob hash rather than commit SHA, so these stay valid if the root commit
 is amended:
@@ -43,17 +49,24 @@ c78a29075b2e  KERNEL_FACTS.md
 d6b1e93df85b  docs/USING_ARCWELL.md
 ee7fd91256d8  docs/campaigns/miss-tier-direct.md
 e600faec6b20  packaging/dkms/arcwell-detect-vram
-02e214afb314  packaging/dkms/install.sh
-a2ed28011114  stub/include/aw_uapi.h
-e374f5818302  stub/src/arcwell.c
+85c68b8df496  packaging/dkms/install.sh
+6627f5c26c81  stub/include/aw_uapi.h
+99485fe44c62  stub/src/arcwell.c
 6fd0b6b50a37  stub/tools/aw_fiemap.c
 13e33ce52288  stub/test/aw_wc_test.c
+e0f7963e7e70  stub/test/aw_wait_race_test.c
 10f2d8ffeadc  HANDOFF.md
-86060985624a  BACKLOG.md
+e0f9d086ef1e  BACKLOG.md
 ```
 
-`stub/src/arcwell.c` is unchanged from rev 3 and so is its hash — the module was
-not touched this revision. What changed is everything that *described* it.
+`stub/src/arcwell.c` and `stub/include/aw_uapi.h` both changed this revision —
+the concurrency fix in §13. Rev 4's claim that the module was untouched no longer
+holds, and neither does the srcversion equality it rested on.
+
+`BACKLOG.md` is pinned last and edited last, on purpose: it is the file that
+records the pinning, so any edit to it after the pin is taken invalidates the pin.
+Rev 5 got this wrong once and pushed two stale pins (`install.sh` and `BACKLOG.md`
+itself) before catching it.
 
 Verify any file with:
 
@@ -66,7 +79,7 @@ Full inventory and tree hash:
 
 ```sh
 git ls-tree -r main | grep -v REVIEWER_PROMPT.md | LC_ALL=C sort -k4 | sha256sum
-# 0ed3dddd778ca61e548dadab6deec5f53624b6f538f5519b94f1827611a082cf
+# 67fee7e5dbdc417149d0dea03be3b1d0b129b1a828092de21ac54e11a8fa9328
 ```
 
 The exclude is not cosmetic. This prompt is a file in the tree it pins, so a hash
@@ -248,15 +261,31 @@ file. **One cell is known to be missing** — see §8.
 
 ## 7. Where I am least confident — start here
 
-1. **Async lifetime.** `aw_submit_batch()` returns with bios in flight pointing at
-   `&inf->ba` inside a heap `struct aw_inflight` (`arcwell.c:139`).
-   `aw_release_file()` drains before freeing. Convince yourself there is no path —
-   error unwind in submit, double collect, `xa_store` failure, two threads calling
-   `AW_IOC_BATCH_WAIT` on one id — where that memory is freed with a bio still
-   referencing it. Newest and least exercised code.
+1. **Async lifetime — the doubt was correct and the path existed. Find the rest.**
+   Rev 3 asked you to "convince yourself there is no path where that memory is
+   freed with a bio still referencing it", and listed "two threads calling
+   `AW_IOC_BATCH_WAIT` on one id" among the candidates. **There was one, and it
+   was that one.** `aw_batch_wait()` did `xa_load` → wait → `xa_erase` → free with
+   the erase's return ignored and no lock across the sequence, so two collectors
+   both got the pointer, both parked on the same completion, and because the
+   completion path used `complete()` — which wakes exactly one — the winner freed
+   the allocation while the loser slept inside it. Double `kfree`, double
+   `kref_put` per referenced buffer, loser parked forever.
+
+   Fixed by claiming the batch under `cl->lock` before waiting (a second
+   collector gets `-EBUSY` and never parks) and by `complete_all()` throughout.
+   The two halves compound: either alone leaves a defect, which is worth knowing
+   before you evaluate the fix. `-EBUSY` is now in the uAPI contract, not just the
+   implementation.
+
+   **So do not treat this section as a list of things I have already cleared.**
+   One of six doubts was a live memory-corruption bug. Assume the same rate
+   applies to what follows.
 2. **`aw_find_get()` vs unmap.** A buffer can be unmapped while a batch holds a
    reference. Check `aw_unmap_buffer()`'s `xa_erase` → `kref_put` ordering against
-   a concurrent submit.
+   a concurrent submit. Structurally the same shape as the bug above — a lookup
+   and a lifetime decision that are not one atomic step — so it deserves the same
+   suspicion rather than the same reassurance.
 3. **Carve clamping.** `vram_usable` is operator-supplied. Unset, the module
    carves by BAR length — over stolen or absent memory. Is a warning enough, or
    should an unset value refuse to load?
@@ -264,11 +293,21 @@ file. **One cell is known to be missing** — see §8.
    already in flight. The caller gets `out_err` and an index, but the buffer may
    hold a partial transfer. Is that stated clearly enough that a consumer cannot
    use half-written weights?
-5. **`aw_pages_present()`** walks every page at registration, `pfn_valid` +
-   `is_pci_p2pdma_page` each. Bounded, but acceptable?
+5. **`move_notify` poisoning.** `dma_buf_pin()` is held for the buffer's whole
+   life, so the exporter must not move it and `move_notify` must not fire. It used
+   to be a bare `pr_warn`, which left a buffer whose `b->pages[]` were stale still
+   accepting transfers. It now `WARN`s and poisons the buffer so every later lookup
+   refuses it. **Bios already in flight cannot be recalled and this does not
+   pretend otherwise.** Two questions: is poisoning the right response, or should
+   it be fatal to the whole module; and is the pin argument actually sound under
+   xe, which is the part I am asserting rather than proving.
 6. **DKMS across a kernel upgrade.** The module uses `pci_p2pdma_add_resource`,
    modern block APIs and `dma_buf_dynamic_attach`. AUTOINSTALL rebuilds on the
    next kernel. Does it fail loudly or silently?
+
+`aw_pages_present()` was doubt 5 in rev 3. It is bounded, off the hot path and
+priced in the header; the previous reviewer called it the weakest of the six and
+was right. Its slot went to `move_notify`.
 
 ## 8. Known gaps — confirm they are stated, do not re-find them
 
@@ -412,3 +451,47 @@ DRM major only, so it cannot open `/dev/arcwell`, and the host that owns the mod
 has no OpenCL runtime. Their sources are untouched this revision and their results
 stand, but the *consumption* leg was not re-executed. The seven transfer cells were,
 red-first, all four red legs going red.
+
+## 13. Rev 5 — the concurrency review, and what is NOT verified
+
+A review of rev 4 returned 22 findings. Five were live; the rest had already been
+fixed in rev 3 or rev 4 and I have re-checked each against the tree rather than
+assuming (the audit is in `BACKLOG.md` T23).
+
+**Two were memory-safety bugs in the shipped module, in code that was public.**
+
+| # | defect | fix |
+|---|---|---|
+| 1 | `aw_batch_wait()` ignored `xa_erase()`'s return and held no lock across load→wait→erase→free. Two collectors on one id both freed the batch: double `kfree`, double `kref_put` per buffer | claim under `cl->lock` before waiting; second collector gets `-EBUSY` and never parks; erase return checked |
+| 2 | every completion used `complete()`, which wakes one waiter. The loser stayed parked inside the allocation the winner freed | `complete_all()` throughout |
+| 3 | no cell ran two waiters against one id | `stub/test/aw_wait_race_test.c`, two red legs |
+| 4 | `move_notify` was a bare `pr_warn`; a moved buffer kept serving transfers from stale `b->pages[]` | `WARN` + poison the buffer; `importer_priv` now set so it can reach it |
+
+Findings 1 and 2 compound — either fix alone still leaves a defect — which is the
+part worth checking in the diff.
+
+**What you must not assume about this revision:**
+
+`data`, the machine with the Arc cards, went off the network partway through this
+work and has not come back. Therefore, stated plainly:
+
+- The fix **compiles clean with no warnings** — but on kernel 7.0.0-rc3 `aarch64`,
+  a *different kernel and a different architecture* from the target. That is a
+  syntax and type check, nothing more.
+- The fix has **never been loaded**. Not once.
+- `aw_wait_race_test.c` has **never been run**, in either leg. It is written and
+  unexecuted. Its green is unclaimed; so is its red.
+- No acceptance cell has been re-run since the change. The srcversion equality
+  that rev 4 rested on (`D28A49C0C00071F811D65EF`) is **void** — the module
+  source changed, and nothing has re-established what the new one does on
+  hardware.
+
+I pushed it anyway, and that is a judgement you should second-guess: a public
+repository carrying a known double-free seemed worse than one carrying a reviewed,
+compiling, hardware-untested fix. The alternative — hold the fix until the host
+returns — leaves the corruption in the published tree in the meantime. Say so if
+you disagree; it is reversible.
+
+**The first thing to do when the host returns** is `aw_wait_race_test` in all
+three legs (normal, `--mutate`, `--serial`), then the full suite, then re-pin the
+srcversion. Until that happens this revision is source review only.

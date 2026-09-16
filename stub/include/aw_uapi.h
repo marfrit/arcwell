@@ -206,6 +206,15 @@ struct aw_ioc_batch_submit {
  *
  * On success the batch is collected and its id becomes invalid. On -EAGAIN the
  * batch is still in flight and the id remains valid.
+ *
+ * ONE COLLECTOR AT A TIME. A batch id may be waited on by only one thread at
+ * once; a second concurrent call for the same id returns -EBUSY immediately and
+ * does not wait. This is a contract, not an implementation detail: the second
+ * caller cannot be allowed to park on a batch the first is about to collect and
+ * free. Sharing one id across threads means serialising them yourself, or
+ * treating -EBUSY as "someone else has it" and moving on.
+ *
+ * -EINVAL means the id is unknown -- never submitted, or already collected.
  */
 struct aw_ioc_batch_wait {
 	__u64 in_batch_id;
